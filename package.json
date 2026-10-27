@@ -1,0 +1,16 @@
+{
+  "name": "nexas-shop-bot",
+  "version": "1.0.0",
+  "description": "Automated Telegram Digital Store Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.7",
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "telegraf": "^4.16.3"
+  }
+}
