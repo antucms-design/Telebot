@@ -330,9 +330,31 @@ bot.command('addbal', async (ctx) => {
   bot.telegram.sendMessage(args[0], `💰 Your wallet credited with $${args[1]}!`).catch(() => {});
 });
 
-const PORT = process.env.PORT || 3000;
+// ১. সার্ভার সচল রাখার জন্য Health Check রুট
 app.get('/', (req, res) => {
   res.send('Nexas Shop Bot is running 24/7!');
 });
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-bot.launch().then(() => console.log('🤖 Bot is live!'));
+
+// ২. টেলিগ্রাম ওয়েবহুক রিসিভার
+app.use(bot.webhookCallback('/telegram-webhook'));
+
+// ৩. যেকোনো এরর আসলে বট যেন ক্র্যাশ না করে
+bot.catch((err, ctx) => {
+  console.error('Bot Error:', err);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  
+  // Render-এর নিজস্ব URL অটোমেটিক ডিটেক্ট করে Webhook সেট করবে
+  const appUrl = process.env.RENDER_EXTERNAL_URL || process.env.VPS_PUBLIC_URL;
+  
+  if (appUrl) {
+    const webhookUrl = `${appUrl.replace(/\/$/, '')}/telegram-webhook`;
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log(`🤖 Webhook successfully set to: ${webhookUrl}`);
+  } else {
+    bot.launch({ dropPendingUpdates: true }).then(() => console.log('🤖 Bot running on Polling!'));
+  }
+});
