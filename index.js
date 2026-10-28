@@ -11,10 +11,8 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-// Customer-er active checkout session mone rakhar Map (5 minutes expiry)
 const pendingCheckouts = new Map();
 
-// Bot Command Menu Setup
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Start and open the menu' },
   { command: 'menu', description: 'Open the main menu' },
@@ -51,7 +49,7 @@ async function getProductStock(product) {
 }
 
 // ==========================================
-// Helper: Exact Screenshot Format Product Delivery
+// PRODSELLER API ORDER FULFILLMENT INTEGRATION
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
@@ -76,23 +74,34 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     deliveredItems = stockItems.map(s => s.data);
   } else if (product.type === 'api') {
     try {
-      const response = await axios.post(product.supplier_api_url, {
-        api_key: product.supplier_api_key,
-        product_id: product.supplier_product_id,
-        quantity: qty
-      });
-      const apiData = response.data.data || response.data.code || response.data.link;
-      if (!apiData) throw new Error();
+      // Prodseller API Header format (X-API-Key)
+      const response = await axios.post(
+        product.supplier_api_url, 
+        {
+          product_id: product.supplier_product_id,
+          quantity: qty
+        },
+        {
+          headers: {
+            'X-API-Key': product.supplier_api_key,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      // Prodseller API response response data parsing
+      const apiData = response.data.data || response.data.link || response.data.code || response.data.accounts;
+      if (!apiData) throw new Error('Invalid supplier response');
       deliveredItems = Array.isArray(apiData) ? apiData : [apiData];
     } catch (err) {
+      const errMsg = err.response?.data?.error || 'Supplier API Error';
       return {
         success: false,
-        message: `❌ Supplier API Error! Apnar payment ($${totalUsd.toFixed(2)} USDT) apnar wallet balance-e add kore dewa hoyeche.`
+        message: `❌ ${errMsg}! Apnar payment ($${totalUsd.toFixed(2)} USDT) apnar wallet balance-e add kore dewa hoyeche.`
       };
     }
   }
 
-  // Exact numeric Order Ref like ORD-1792937878366
   const orderId = 'ORD-' + Date.now() + Math.floor(10 + Math.random() * 90);
   const deliveredText = deliveredItems.join('\n\n');
 
@@ -276,7 +285,7 @@ bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 // ==========================================
-// 5. DIRECT CHECKOUT INSTRUCTIONS (Waiting for ID Paste)
+// 5. DIRECT CHECKOUT INSTRUCTIONS
 // ==========================================
 bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
   const method = ctx.match[1];
@@ -508,10 +517,11 @@ bot.command('recover', async (ctx) => {
 
 function isAdmin(ctx) { return String(ctx.from.id) === String(process.env.ADMIN_ID); }
 
+// নতুন প্রোডাক্ট অ্যাড করার নিয়ম (Prodseller API Supported)
 bot.command('addprod', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const args = ctx.message.text.replace('/addprod ', '').split('|').map(s => s.trim());
-  if (args.length < 4) return ctx.reply('Format:\n/addprod Category | Plan Name | Price | Details | [local/api]');
+  if (args.length < 4) return ctx.reply('Format:\n/addprod Category | Plan Name | Price | Details | [local/api] | Supplier_Order_URL | Supplier_API_Key | Supplier_Product_ID');
   const [category, name, price, description, type = 'local', url = null, key = null, prodId = null] = args;
   
   const { data, error } = await supabase.from('products').insert([{
@@ -568,9 +578,6 @@ bot.on('text', async (ctx) => {
 
   const user = await getUser(ctx);
 
-  // ------------------------------------------
-  // A. Direct Binance Transfer Order ID Paste
-  // ------------------------------------------
   if (session.method === 'binance') {
     const orderId = rawText.replace(/\s+/g, '');
     const trxKey = 'BN_' + orderId;
@@ -617,7 +624,6 @@ bot.on('text', async (ctx) => {
         await supabase.from('payments').insert([{ trx_id: trxKey, amount: paidAmount, sender: 'Binance', is_used: true }]);
         pendingCheckouts.delete(ctx.from.id);
 
-        // Extra pathale wallet-e joma hobe
         const extra = Number((paidAmount - session.totalUsd).toFixed(2));
         if (extra > 0) {
           await supabase.from('users').update({ balance: Number(user.balance) + extra }).eq('telegram_id', user.telegram_id);
@@ -649,13 +655,10 @@ bot.on('text', async (ctx) => {
         );
       }
     } catch (err) {
-      return ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, '❌ Binance API verify korte somossa hoyeche. API Key permission check korun.');
+      return ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, '❌ Binance API verify korte somossa hoyeche.');
     }
   }
 
-  // ------------------------------------------
-  // B. Direct bKash TrxID Paste
-  // ------------------------------------------
   if (session.method === 'bkash') {
     const trxId = rawText.replace(/\s+/g, '').toUpperCase();
     const { data: payment } = await supabase.from('payments').select('*').eq('trx_id', trxId).single();
