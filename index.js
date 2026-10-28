@@ -1,3 +1,5 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first'); // Render ETIMEDOUT এরর চিরতরে বন্ধ করবে!
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
@@ -713,21 +715,32 @@ bot.on('text', async (ctx) => {
 });
 
 // ==========================================
-// 10. Server & Webhook Setup
+// 10. Server & Safe Webhook Setup (No ETIMEDOUT Crash)
 // ==========================================
 app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7!'));
 app.use(bot.webhookCallback('/telegram-webhook'));
 bot.catch((err) => console.error('Bot Error:', err));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  
   const appUrl = process.env.RENDER_EXTERNAL_URL || process.env.VPS_PUBLIC_URL;
   if (appUrl) {
     const webhookUrl = `${appUrl.replace(/\/$/, '')}/telegram-webhook`;
-    await bot.telegram.setWebhook(webhookUrl);
-    console.log(`🤖 Webhook active at: ${webhookUrl}`);
+    
+    // Safe Webhook setup with Auto-Retry so Render deploy never fails
+    const connectWebhook = async () => {
+      try {
+        await bot.telegram.setWebhook(webhookUrl);
+        console.log(`🤖 Webhook active at: ${webhookUrl}`);
+      } catch (err) {
+        console.error('⚠️ Webhook timeout, retrying in 5 seconds...', err.message);
+        setTimeout(connectWebhook, 5000);
+      }
+    };
+    connectWebhook();
   } else {
-    bot.launch({ dropPendingUpdates: true });
+    bot.launch({ dropPendingUpdates: true }).catch(console.error);
   }
 });
