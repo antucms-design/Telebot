@@ -89,6 +89,73 @@ async function getProductStock(product) {
 }
 
 // ==========================================
+// SMART EXTRACTOR FOR PRODSELLER & ANY SUPPLIER API
+// ==========================================
+function extractRealDeliveryItems(obj) {
+  const results = [];
+  const ignoreKeys = [
+    'id', 'orderid', 'order_id', 'productid', 'product_id', 'status', 'type',
+    'currency', 'createdat', 'created_at', 'updatedat', 'updated_at',
+    'message', 'productname', 'product_name', 'name', 'title', 'price',
+    'total', 'amount', 'quantity', 'qty', 'userid', 'user_id'
+  ];
+  const ignoreValues = [
+    'instant', 'completed', 'success', 'paid', 'delivered', 'ok',
+    'true', 'false', 'active', 'usd', 'usdt', 'pending', 'processing'
+  ];
+
+  function scan(val, keyName = '') {
+    if (val === null || val === undefined) return;
+    const kLower = keyName.toLowerCase();
+
+    if (typeof val === 'string') {
+      const s = val.trim();
+      if (!s || ignoreValues.includes(s.toLowerCase())) return;
+
+      // ১. যদি সরাসরি কোনো লিংক (URL) হয়
+      if (s.startsWith('http://') || s.startsWith('https://')) {
+        results.push(s);
+        return;
+      }
+
+      // ২. যদি নির্দিষ্ট ডেলিভারি ফিল্ডের ভেতরে থাকে
+      const targetKeys = [
+        'key', 'keys', 'code', 'codes', 'link', 'links', 'account', 'accounts',
+        'credential', 'credentials', 'item', 'items', 'data', 'value', 'secret',
+        'token', 'content', ' delivered', 'stock', 'payload', 'text', 'redeem'
+      ];
+      if (targetKeys.includes(kLower) && !ignoreKeys.includes(kLower)) {
+        results.push(s);
+        return;
+      }
+
+      // ৩. যদি ইমেইল:পাসওয়ার্ড বা বড় অ্যাক্সেস টোকেন হয় (এবং কোনো সাধারণ আইডি না হয়)
+      if (!ignoreKeys.includes(kLower) && (s.includes(':') || s.includes('@') || s.length > 18)) {
+        // ISO Date বাদ দেওয়া
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) {
+          results.push(s);
+        }
+      }
+    } else if (Array.isArray(val)) {
+      val.forEach(item => scan(item, keyName));
+    } else if (typeof val === 'object') {
+      for (const [k, v] of Object.entries(val)) {
+        // {"type":"instant"} অবজেক্ট সম্পূর্ণ স্কিপ করবে
+        if (k.toLowerCase() === 'delivery' && typeof v === 'object' && v !== null && v.type === 'instant' && Object.keys(v).length === 1) {
+          continue;
+        }
+        if (!ignoreKeys.includes(k.toLowerCase())) {
+          scan(v, k);
+        }
+      }
+    }
+  }
+
+  scan(obj);
+  return [...new Set(results)];
+}
+
+// ==========================================
 // ORDER DELIVERY (LOCAL + PRODSELLER API FIXED)
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
@@ -123,7 +190,12 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
         ? product.supplier_product_id
         : Number(product.supplier_product_id);
 
-      // ProdSeller ও অন্যান্য সব সাপ্লায়ারের জন্য productId এবং product_id দুটোই পাঠানো হচ্ছে
+      const headers = {
+        'X-API-Key': apiKey,
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      };
+
       const response = await axios.post(
         orderUrl,
         {
@@ -132,45 +204,28 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
           quantity: Number(qty),
           qty: Number(qty)
         },
-        {
-          headers: {
-            'X-API-Key': apiKey,
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-          }
-        }
+        { headers }
       );
 
       const resData = response.data;
-      const rawItems =
-        resData.data ||
-        resData.items ||
-        resData.keys ||
-        resData.links ||
-        resData.accounts ||
-        resData.code ||
-        resData.link ||
-        resData.content ||
-        resData.delivery ||
-        resData.order?.items ||
-        resData.order?.data ||
-        resData.order?.keys ||
-        resData.order?.content;
-      
-      if (!rawItems) throw new Error('Empty delivery from supplier');
+      console.log('📦 Supplier Order Response:', JSON.stringify(resData));
 
-      if (Array.isArray(rawItems)) {
-        deliveredItems = rawItems.map(item =>
-          typeof item === 'object'
-            ? item.data || item.key || item.link || item.code || item.content || item.account || JSON.stringify(item)
-            : item
-        );
-      } else if (typeof rawItems === 'object') {
-        deliveredItems = [
-          rawItems.data || rawItems.key || rawItems.link || rawItems.content || JSON.stringify(rawItems)
-        ];
-      } else {
-        deliveredItems = [String(rawItems)];
+      deliveredItems = extractRealDeliveryItems(resData);
+
+      // যদি প্রথম রেসপন্সে শুধু Order ID থাকে, তবে GET /v1/orders/:id কল করে আসল লিংক আনা হবে
+      const supOrderId = resData.id || resData.orderId || resData.order_id || resData.order?.id || resData.data?.id;
+      if (deliveredItems.length === 0 && supOrderId) {
+        try {
+          const statusRes = await axios.get(`${baseUrl}/v1/orders/${supOrderId}`, { headers });
+          console.log('📦 Supplier Order Status Response:', JSON.stringify(statusRes.data));
+          deliveredItems = extractRealDeliveryItems(statusRes.data);
+        } catch (e) {
+          console.error('Order status fetch error:', e.message);
+        }
+      }
+
+      if (deliveredItems.length === 0) {
+        deliveredItems = [JSON.stringify(resData)];
       }
 
       if (product.api_stock && product.api_stock >= qty) {
@@ -646,10 +701,27 @@ bot.command('supplier', async (ctx) => {
     `💰 <b>Supplier Balance:</b> <b>${balText}</b>\n\n` +
     `📌 <b>Useful Admin Commands:</b>\n` +
     `• <code>/sync</code> — Auto-import/update all products\n` +
+    `• <code>/lastorders</code> — Check supplier recent orders & links\n` +
     `• <code>/setsupplier URL | API_KEY | PROFIT%</code> — Change supplier anytime\n` +
     `• <code>/clearapi</code> — Delete all API products`,
     { parse_mode: 'HTML' }
   );
+});
+
+// সাপ্লায়ার থেকে সর্বশেষ অর্ডারের আসল ডাটা ও লিংক দেখার কমান্ড (/lastorders)
+bot.command('lastorders', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    const sup = await getSupplierConfig();
+    const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
+    const res = await axios.get(`${baseUrl}/v1/orders`, {
+      headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+    });
+    const text = JSON.stringify(res.data, null, 2).slice(0, 3800);
+    ctx.reply(`📦 <b>Supplier Last Orders Raw Data:</b>\n<pre>${text}</pre>`, { parse_mode: 'HTML' });
+  } catch (err) {
+    ctx.reply('Error: ' + (err.response?.data?.error || err.message));
+  }
 });
 
 bot.command('setsupplier', async (ctx) => {
