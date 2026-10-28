@@ -1,5 +1,6 @@
 const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first'); // Render ETIMEDOUT এরর চিরতরে বন্ধ করবে!
+dns.setDefaultResultOrder('ipv4first'); // Render ETIMEDOUT ফিক্স
+
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
@@ -40,8 +41,20 @@ async function getUser(ctx, startPayload = null) {
   return user;
 }
 
+// ডাটাবেস থেকে বর্তমান সাপ্লায়ার কনফিগ আনা
+async function getSupplierConfig() {
+  const { data } = await supabase.from('settings').select('*').eq('id', 1).single();
+  return data || {
+    supplier_base_url: 'https://prodseller.com',
+    supplier_api_key: 'psk_701f79a0c971f198abbcdc3978e5804b2b8b587f239be728',
+    profit_margin: 20
+  };
+}
+
 async function getProductStock(product) {
-  if (product.type === 'api') return 999;
+  if (product.type === 'api') {
+    return product.api_stock !== null && product.api_stock !== undefined ? product.api_stock : 999;
+  }
   const { count } = await supabase
     .from('stock')
     .select('*', { count: 'exact', head: true })
@@ -51,7 +64,7 @@ async function getProductStock(product) {
 }
 
 // ==========================================
-// PRODSELLER API ORDER FULFILLMENT INTEGRATION
+// DYNAMIC SUPPLIER API & LOCAL ORDER DELIVERY
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
@@ -76,30 +89,48 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     deliveredItems = stockItems.map(s => s.data);
   } else if (product.type === 'api') {
     try {
-      // Prodseller API Header format (X-API-Key)
+      const supConfig = await getSupplierConfig();
+      const baseUrl = supConfig.supplier_base_url.replace(/\/$/, '');
+      const apiKey = product.supplier_api_key || supConfig.supplier_api_key;
+      const orderUrl = product.supplier_api_url || `${baseUrl}/v1/orders`;
+
       const response = await axios.post(
-        product.supplier_api_url, 
+        orderUrl,
         {
-          product_id: product.supplier_product_id,
+          product_id: isNaN(product.supplier_product_id) ? product.supplier_product_id : Number(product.supplier_product_id),
           quantity: qty
         },
         {
           headers: {
-            'X-API-Key': product.supplier_api_key,
+            'X-API-Key': apiKey,
+            'Authorization': `Bearer ${apiKey}`,
             'Content-Type': 'application/json'
           }
         }
       );
 
-      // Prodseller API response response data parsing
-      const apiData = response.data.data || response.data.link || response.data.code || response.data.accounts;
-      if (!apiData) throw new Error('Invalid supplier response');
-      deliveredItems = Array.isArray(apiData) ? apiData : [apiData];
+      const resData = response.data;
+      const rawItems = resData.data || resData.items || resData.keys || resData.links || resData.accounts || resData.code || resData.link || resData.order?.items || resData.order?.data;
+      
+      if (!rawItems) throw new Error('Empty delivery from supplier');
+
+      if (Array.isArray(rawItems)) {
+        deliveredItems = rawItems.map(item => (typeof item === 'object' ? (item.data || item.key || item.link || item.code || JSON.stringify(item)) : item));
+      } else if (typeof rawItems === 'object') {
+        deliveredItems = [rawItems.data || rawItems.key || rawItems.link || JSON.stringify(rawItems)];
+      } else {
+        deliveredItems = [String(rawItems)];
+      }
+
+      // স্টক কমানো
+      if (product.api_stock && product.api_stock >= qty) {
+        await supabase.from('products').update({ api_stock: product.api_stock - qty }).eq('id', product.id);
+      }
     } catch (err) {
-      const errMsg = err.response?.data?.error || 'Supplier API Error';
+      const errMsg = err.response?.data?.error || err.response?.data?.message || err.message || 'Supplier API Error';
       return {
         success: false,
-        message: `❌ ${errMsg}! Apnar payment ($${totalUsd.toFixed(2)} USDT) apnar wallet balance-e add kore dewa hoyeche.`
+        message: `❌ Supplier Error (${errMsg})! Apnar payment ($${totalUsd.toFixed(2)} USDT) apnar wallet balance-e add kore dewa hoyeche.`
       };
     }
   }
@@ -168,7 +199,7 @@ async function showCatalog(ctx, isEdit = true) {
   const { data: products } = await supabase.from('products').select('*').order('id', { ascending: true });
 
   if (!products || products.length === 0) {
-    const emptyMsg = '🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Currently kono product stock-e nei.';
+    const emptyMsg = '🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Currently kono product stock-e nei.\n\n<i>Admin hole /sync command diye supplier theke auto-import korun!</i>';
     const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]]);
     return isEdit ? ctx.editMessageText(emptyMsg, { parse_mode: 'HTML', ...kb }) : ctx.reply(emptyMsg, { parse_mode: 'HTML', ...kb });
   }
@@ -458,7 +489,7 @@ app.post('/webhook/sms', async (req, res) => {
 });
 
 // ==========================================
-// 8. Other Menus & Admin Commands
+// 8. Other Menus
 // ==========================================
 bot.command('api', async (ctx) => {
   const user = await getUser(ctx);
@@ -517,13 +548,166 @@ bot.command('recover', async (ctx) => {
   ctx.reply(`✅ <b>Order Found!</b>\n\n🔑 Data:\n<code>${order.delivered_data}</code>`, { parse_mode: 'HTML' });
 });
 
+// ==========================================
+// 9. ADMIN COMMANDS: SUPPLIER MANAGER & 1-CLICK AUTO SYNC
+// ==========================================
 function isAdmin(ctx) { return String(ctx.from.id) === String(process.env.ADMIN_ID); }
 
-// নতুন প্রোডাক্ট অ্যাড করার নিয়ম (Prodseller API Supported)
+// বর্তমান সাপ্লায়ার দেখা ও সাপ্লায়ারের ব্যালেন্স চেক (/supplier)
+bot.command('supplier', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const sup = await getSupplierConfig();
+  let balText = 'Checking...';
+  try {
+    const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
+    const res = await axios.get(`${baseUrl}/v1/balance`, {
+      headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+    });
+    balText = `$${res.data.balance ?? res.data.data?.balance ?? JSON.stringify(res.data)} USDT`;
+  } catch (e) {
+    balText = 'Could not fetch balance';
+  }
+
+  ctx.reply(
+    `⚙️ <b>CURRENT SUPPLIER SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `🌐 <b>Base URL:</b> <code>${sup.supplier_base_url}</code>\n` +
+    `🔑 <b>API Key:</b> <code>${sup.supplier_api_key}</code>\n` +
+    `📈 <b>Profit Margin:</b> <code>${sup.profit_margin}%</code>\n` +
+    `💰 <b>Supplier Balance:</b> <b>${balText}</b>\n\n` +
+    `📌 <b>Useful Admin Commands:</b>\n` +
+    `• <code>/sync</code> — Auto-import/update all products\n` +
+    `• <code>/setsupplier URL | API_KEY | PROFIT%</code> — Change supplier anytime\n` +
+    `• <code>/clearapi</code> — Delete all API products`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+// যেকোনো সময় সাপ্লায়ার পরিবর্তন (/setsupplier URL | KEY | PROFIT%)
+bot.command('setsupplier', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const args = ctx.message.text.replace('/setsupplier ', '').split('|').map(s => s.trim());
+  if (args.length < 2) {
+    return ctx.reply('সাপ্লায়ার পরিবর্তন করতে এভাবে দিন:\n<code>/setsupplier https://prodseller.com | psk_your_key | 20</code>\n\n(এখানে 20 মানে সাপ্লায়ারের দামের চেয়ে ২০% বেশি দামে আপনার স্টোরে যুক্ত হবে)', { parse_mode: 'HTML' });
+  }
+
+  const [url, key, margin = '20'] = args;
+  await supabase.from('settings').upsert([{
+    id: 1,
+    supplier_base_url: url.replace(/\/$/, ''),
+    supplier_api_key: key,
+    profit_margin: parseFloat(margin)
+  }]);
+
+  ctx.reply(`✅ <b>Supplier Updated Successfully!</b>\n\n🌐 URL: <code>${url}</code>\n📈 Profit Margin: <b>${margin}%</b>\n\nএখন সব প্রোডাক্ট আপনার স্টোরে আনতে <code>/sync</code> কমান্ড দিন!`, { parse_mode: 'HTML' });
+});
+
+// ১ ক্লিকে সাপ্লায়ারের সব প্রোডাক্ট, দাম ও স্টক ইমপোর্ট (/sync)
+bot.command('sync', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const wait = await ctx.reply('🔄 <b>Syncing products from supplier...</b>', { parse_mode: 'HTML' });
+
+  try {
+    const sup = await getSupplierConfig();
+    const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
+    
+    // Try /v1/products or /api/v1/products
+    let res;
+    try {
+      res = await axios.get(`${baseUrl}/v1/products`, {
+        headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+      });
+    } catch (err1) {
+      res = await axios.get(`${baseUrl}/api/v1/products`, {
+        headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+      });
+    }
+
+    const list = Array.isArray(res.data) ? res.data : (res.data.products || res.data.data || []);
+    if (!Array.isArray(list) || list.length === 0) {
+      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ সাপ্লায়ার থেকে কোনো প্রোডাক্ট পাওয়া যায়নি।');
+    }
+
+    const margin = parseFloat(sup.profit_margin || 0);
+    const orderEndpoint = `${baseUrl}/v1/orders`;
+    let added = 0;
+    let updated = 0;
+
+    for (const item of list) {
+      const suppId = String(item.id || item.product_id || item._id);
+      const rawName = item.name || item.title || 'Digital Product';
+      
+      // নাম থেকে Category ও Plan আলাদা করা (যেমন: "Gemini AI Pro - 18 Months Link")
+      let category = item.category || item.group || rawName;
+      let planName = item.plan || item.variant || rawName;
+      if (!item.category && rawName.includes(' - ')) {
+        const parts = rawName.split(' - ');
+        category = parts[0].trim();
+        planName = parts.slice(1).join(' - ').trim();
+      }
+
+      const basePrice = parseFloat(item.price || item.cost || 1.0);
+      const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
+      const stock = item.stock !== undefined ? Number(item.stock) : (item.quantity !== undefined ? Number(item.quantity) : 999);
+      const desc = item.description || item.details || '• Instant Automated Delivery\n• Activate on your own account';
+
+      const { data: existing } = await supabase
+        .from('products')
+        .select('id')
+        .eq('type', 'api')
+        .eq('supplier_product_id', suppId)
+        .single();
+
+      if (existing) {
+        await supabase.from('products').update({
+          category,
+          name: planName,
+          price: sellPrice,
+          description: desc,
+          api_stock: stock,
+          supplier_api_url: orderEndpoint,
+          supplier_api_key: sup.supplier_api_key
+        }).eq('id', existing.id);
+        updated++;
+      } else {
+        await supabase.from('products').insert([{
+          category,
+          name: planName,
+          price: sellPrice,
+          description: desc,
+          type: 'api',
+          api_stock: stock,
+          supplier_api_url: orderEndpoint,
+          supplier_api_key: sup.supplier_api_key,
+          supplier_product_id: suppId
+        }]);
+        added++;
+      }
+    }
+
+    ctx.telegram.editMessageText(
+      ctx.chat.id,
+      wait.message_id,
+      null,
+      `✅ <b>Supplier Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━\n🆕 <b>New Products Added:</b> ${added}\n🔄 <b>Products Updated:</b> ${updated}\n📈 <b>Profit Margin Applied:</b> +${margin}%\n\nএখন <code>/products</code> লিখে আপনার নতুন ক্যাটালগ দেখুন!`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, `❌ Sync Error: ${errMsg}`);
+  }
+});
+
+// সাপ্লায়ার পরিবর্তন করলে আগের সাপ্লায়ারের প্রোডাক্ট মুছে ফেলার কমান্ড (/clearapi)
+bot.command('clearapi', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await supabase.from('products').delete().eq('type', 'api');
+  ctx.reply('🗑️ আগের সাপ্লায়ারের সব API প্রোডাক্ট মুছে ফেলা হয়েছে! নতুন সাপ্লায়ারের প্রোডাক্ট আনতে `/sync` দিন।');
+});
+
 bot.command('addprod', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const args = ctx.message.text.replace('/addprod ', '').split('|').map(s => s.trim());
-  if (args.length < 4) return ctx.reply('Format:\n/addprod Category | Plan Name | Price | Details | [local/api] | Supplier_Order_URL | Supplier_API_Key | Supplier_Product_ID');
+  if (args.length < 4) return ctx.reply('Format:\n/addprod Category | Plan Name | Price | Details | [local/api]');
   const [category, name, price, description, type = 'local', url = null, key = null, prodId = null] = args;
   
   const { data, error } = await supabase.from('products').insert([{
@@ -564,7 +748,7 @@ bot.command('addbal', async (ctx) => {
 });
 
 // ==========================================
-// 9. AUTO VERIFY & INSTANT LINK DELIVERY ON ID PASTE
+// 10. AUTO VERIFY & INSTANT LINK DELIVERY ON ID PASTE
 // ==========================================
 bot.on('text', async (ctx) => {
   const rawText = ctx.message.text.trim();
@@ -715,7 +899,7 @@ bot.on('text', async (ctx) => {
 });
 
 // ==========================================
-// 10. Server & Safe Webhook Setup (No ETIMEDOUT Crash)
+// 11. Safe Server & Webhook Setup
 // ==========================================
 app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7!'));
 app.use(bot.webhookCallback('/telegram-webhook'));
@@ -724,18 +908,15 @@ bot.catch((err) => console.error('Bot Error:', err));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  
   const appUrl = process.env.RENDER_EXTERNAL_URL || process.env.VPS_PUBLIC_URL;
   if (appUrl) {
     const webhookUrl = `${appUrl.replace(/\/$/, '')}/telegram-webhook`;
-    
-    // Safe Webhook setup with Auto-Retry so Render deploy never fails
     const connectWebhook = async () => {
       try {
         await bot.telegram.setWebhook(webhookUrl);
         console.log(`🤖 Webhook active at: ${webhookUrl}`);
       } catch (err) {
-        console.error('⚠️ Webhook timeout, retrying in 5 seconds...', err.message);
+        console.error('⚠️ Webhook retry in 5s...', err.message);
         setTimeout(connectWebhook, 5000);
       }
     };
