@@ -1,5 +1,5 @@
 const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first'); // Render ETIMEDOUT ফিক্স
+dns.setDefaultResultOrder('ipv4first');
 
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -41,7 +41,6 @@ async function getUser(ctx, startPayload = null) {
   return user;
 }
 
-// ডাটাবেস থেকে বর্তমান সাপ্লায়ার কনফিগ আনা
 async function getSupplierConfig() {
   const { data } = await supabase.from('settings').select('*').eq('id', 1).single();
   return data || {
@@ -63,9 +62,6 @@ async function getProductStock(product) {
   return count || 0;
 }
 
-// ==========================================
-// DYNAMIC SUPPLIER API & LOCAL ORDER DELIVERY
-// ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
 
@@ -122,7 +118,6 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
         deliveredItems = [String(rawItems)];
       }
 
-      // স্টক কমানো
       if (product.api_stock && product.api_stock >= qty) {
         await supabase.from('products').update({ api_stock: product.api_stock - qty }).eq('id', product.id);
       }
@@ -168,9 +163,6 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   return { success: true, message: msg, keyboard };
 }
 
-// ==========================================
-// 1. Main Menu UI
-// ==========================================
 async function sendMainMenu(ctx, isEdit = false) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
@@ -191,9 +183,6 @@ bot.start((ctx) => { getUser(ctx, ctx.startPayload); sendMainMenu(ctx, false); }
 bot.command('menu', (ctx) => sendMainMenu(ctx, false));
 bot.action('main_menu', (ctx) => { ctx.answerCbQuery(); sendMainMenu(ctx, true); });
 
-// ==========================================
-// 2. 2-Column Cloud Store Catalog
-// ==========================================
 async function showCatalog(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
   const { data: products } = await supabase.from('products').select('*').order('id', { ascending: true });
@@ -234,7 +223,7 @@ async function showCatalog(ctx, isEdit = true) {
 
   buttons.push([Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]);
 
-  const text = `🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n🚀 Instant Delivery 24/7\n📦 Total Products: <b>${catList.length}</b>\n\n👇 Choose a product below :`;
+  const text = `🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n🚀 Instant Delivery 24/7\n📦 Total Categories: <b>${catList.length}</b>\n\n👇 Choose a product below :`;
 
   if (isEdit) return ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
   return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
@@ -243,9 +232,6 @@ async function showCatalog(ctx, isEdit = true) {
 bot.action('menu_shop', (ctx) => { ctx.answerCbQuery(); showCatalog(ctx, true); });
 bot.command('products', (ctx) => showCatalog(ctx, false));
 
-// ==========================================
-// 3. Category View & Variants
-// ==========================================
 bot.action(/cat_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
   pendingCheckouts.delete(ctx.from.id);
@@ -271,9 +257,6 @@ bot.action(/cat_(\d+)/, async (ctx) => {
   ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
 });
 
-// ==========================================
-// 4. Quantity Selector & Payment Options
-// ==========================================
 bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
   pendingCheckouts.delete(ctx.from.id);
@@ -317,9 +300,6 @@ bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
 
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
-// ==========================================
-// 5. DIRECT CHECKOUT INSTRUCTIONS
-// ==========================================
 bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
   const method = ctx.match[1];
   const prodId = Number(ctx.match[2]);
@@ -406,9 +386,6 @@ bot.action('help_orderid', (ctx) => {
   ctx.answerCbQuery('Binance App ➔ Pay ➔ Transaction History ➔ Tap on payment ➔ Copy the "Order ID" and send it directly in this chat!', { show_alert: true });
 });
 
-// ==========================================
-// 6. Pay with Wallet Balance
-// ==========================================
 bot.action(/buy_(\d+)_(\d+)/, async (ctx) => {
   const prodId = Number(ctx.match[1]);
   const qty = Number(ctx.match[2]);
@@ -439,9 +416,6 @@ bot.action(/buy_(\d+)_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// ==========================================
-// 7. Wallet Deposit & SMS Webhook
-// ==========================================
 async function showWallet(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
@@ -488,9 +462,6 @@ app.post('/webhook/sms', async (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// ==========================================
-// 8. Other Menus
-// ==========================================
 bot.command('api', async (ctx) => {
   const user = await getUser(ctx);
   ctx.reply(`🔑 <b>Your Reseller API Key:</b>\n<code>${user.api_key}</code>`, { parse_mode: 'HTML' });
@@ -548,12 +519,8 @@ bot.command('recover', async (ctx) => {
   ctx.reply(`✅ <b>Order Found!</b>\n\n🔑 Data:\n<code>${order.delivered_data}</code>`, { parse_mode: 'HTML' });
 });
 
-// ==========================================
-// 9. ADMIN COMMANDS: SUPPLIER MANAGER & 1-CLICK AUTO SYNC
-// ==========================================
 function isAdmin(ctx) { return String(ctx.from.id) === String(process.env.ADMIN_ID); }
 
-// বর্তমান সাপ্লায়ার দেখা ও সাপ্লায়ারের ব্যালেন্স চেক (/supplier)
 bot.command('supplier', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const sup = await getSupplierConfig();
@@ -582,12 +549,11 @@ bot.command('supplier', async (ctx) => {
   );
 });
 
-// যেকোনো সময় সাপ্লায়ার পরিবর্তন (/setsupplier URL | KEY | PROFIT%)
 bot.command('setsupplier', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const args = ctx.message.text.replace('/setsupplier ', '').split('|').map(s => s.trim());
   if (args.length < 2) {
-    return ctx.reply('সাপ্লায়ার পরিবর্তন করতে এভাবে দিন:\n<code>/setsupplier https://prodseller.com | psk_your_key | 20</code>\n\n(এখানে 20 মানে সাপ্লায়ারের দামের চেয়ে ২০% বেশি দামে আপনার স্টোরে যুক্ত হবে)', { parse_mode: 'HTML' });
+    return ctx.reply('Format:\n<code>/setsupplier https://prodseller.com | psk_your_key | 20</code>', { parse_mode: 'HTML' });
   }
 
   const [url, key, margin = '20'] = args;
@@ -598,10 +564,10 @@ bot.command('setsupplier', async (ctx) => {
     profit_margin: parseFloat(margin)
   }]);
 
-  ctx.reply(`✅ <b>Supplier Updated Successfully!</b>\n\n🌐 URL: <code>${url}</code>\n📈 Profit Margin: <b>${margin}%</b>\n\nএখন সব প্রোডাক্ট আপনার স্টোরে আনতে <code>/sync</code> কমান্ড দিন!`, { parse_mode: 'HTML' });
+  ctx.reply(`✅ <b>Supplier Updated Successfully!</b>\n\n🌐 URL: <code>${url}</code>\n📈 Profit Margin: <b>${margin}%</b>\n\nEkhon <code>/sync</code> command din!`, { parse_mode: 'HTML' });
 });
 
-// ১ ক্লিকে সাপ্লায়ারের সব প্রোডাক্ট, দাম ও স্টক ইমপোর্ট (/sync)
+// UPDATED SYNC COMMAND WITH DEFAULT STOCK FIX
 bot.command('sync', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const wait = await ctx.reply('🔄 <b>Syncing products from supplier...</b>', { parse_mode: 'HTML' });
@@ -610,7 +576,6 @@ bot.command('sync', async (ctx) => {
     const sup = await getSupplierConfig();
     const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
     
-    // Try /v1/products or /api/v1/products
     let res;
     try {
       res = await axios.get(`${baseUrl}/v1/products`, {
@@ -624,7 +589,7 @@ bot.command('sync', async (ctx) => {
 
     const list = Array.isArray(res.data) ? res.data : (res.data.products || res.data.data || []);
     if (!Array.isArray(list) || list.length === 0) {
-      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ সাপ্লায়ার থেকে কোনো প্রোডাক্ট পাওয়া যায়নি।');
+      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Supplier theke kono product pawa jayni.');
     }
 
     const margin = parseFloat(sup.profit_margin || 0);
@@ -636,7 +601,6 @@ bot.command('sync', async (ctx) => {
       const suppId = String(item.id || item.product_id || item._id);
       const rawName = item.name || item.title || 'Digital Product';
       
-      // নাম থেকে Category ও Plan আলাদা করা (যেমন: "Gemini AI Pro - 18 Months Link")
       let category = item.category || item.group || rawName;
       let planName = item.plan || item.variant || rawName;
       if (!item.category && rawName.includes(' - ')) {
@@ -647,7 +611,13 @@ bot.command('sync', async (ctx) => {
 
       const basePrice = parseFloat(item.price || item.cost || 1.0);
       const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
-      const stock = item.stock !== undefined ? Number(item.stock) : (item.quantity !== undefined ? Number(item.quantity) : 999);
+      
+      // Stock fix: Jodi supplier stock na dey ba 0 thake, tobe by default 999 set hobe
+      let stock = 999;
+      if (item.stock !== undefined && item.stock !== null) stock = Number(item.stock);
+      else if (item.quantity !== undefined && item.quantity !== null) stock = Number(item.quantity);
+      if (stock <= 0) stock = 999;
+
       const desc = item.description || item.details || '• Instant Automated Delivery\n• Activate on your own account';
 
       const { data: existing } = await supabase
@@ -688,7 +658,7 @@ bot.command('sync', async (ctx) => {
       ctx.chat.id,
       wait.message_id,
       null,
-      `✅ <b>Supplier Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━\n🆕 <b>New Products Added:</b> ${added}\n🔄 <b>Products Updated:</b> ${updated}\n📈 <b>Profit Margin Applied:</b> +${margin}%\n\nএখন <code>/products</code> লিখে আপনার নতুন ক্যাটালগ দেখুন!`,
+      `✅ <b>Supplier Sync Completed!</b>\n━━━━━━━━━━━━━━━━━━━━\n🆕 <b>New Products Added:</b> ${added}\n🔄 <b>Products Updated:</b> ${updated}\n📈 <b>Profit Margin:</b> +${margin}%\n\nEkhon <code>/products</code> likhe catalog dekhun!`,
       { parse_mode: 'HTML' }
     );
   } catch (err) {
@@ -697,11 +667,10 @@ bot.command('sync', async (ctx) => {
   }
 });
 
-// সাপ্লায়ার পরিবর্তন করলে আগের সাপ্লায়ারের প্রোডাক্ট মুছে ফেলার কমান্ড (/clearapi)
 bot.command('clearapi', async (ctx) => {
   if (!isAdmin(ctx)) return;
   await supabase.from('products').delete().eq('type', 'api');
-  ctx.reply('🗑️ আগের সাপ্লায়ারের সব API প্রোডাক্ট মুছে ফেলা হয়েছে! নতুন সাপ্লায়ারের প্রোডাক্ট আনতে `/sync` দিন।');
+  ctx.reply('🗑️ Sob API products delete kora hoyeche! Notun kore sync korte `/sync` din.');
 });
 
 bot.command('addprod', async (ctx) => {
@@ -720,7 +689,7 @@ bot.command('addprod', async (ctx) => {
 bot.command('addstock', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const args = ctx.message.text.replace('/addstock ', '').split('|').map(s => s.trim());
-  if (args.length < 2) return ctx.reply('Format: /addstock ProductID | Link_or_Account');
+  if (args.length < 2) return ctx.reply('Format: /addstock ProductID | Link');
   await supabase.from('stock').insert([{ product_id: parseInt(args[0]), data: args[1] }]);
   ctx.reply(`✅ Stock added to Product ID ${args[0]}!`);
 });
@@ -747,9 +716,6 @@ bot.command('addbal', async (ctx) => {
   ctx.reply(`✅ Added $${args[1]} to ${args[0]}`);
 });
 
-// ==========================================
-// 10. AUTO VERIFY & INSTANT LINK DELIVERY ON ID PASTE
-// ==========================================
 bot.on('text', async (ctx) => {
   const rawText = ctx.message.text.trim();
   if (rawText.startsWith('/')) return;
@@ -759,7 +725,7 @@ bot.on('text', async (ctx) => {
 
   if (Date.now() > session.expiresAt) {
     pendingCheckouts.delete(ctx.from.id);
-    return ctx.reply('⏰ Apnar 5 minutes checkout session expire hoye geche! Product-ti abar select korun.');
+    return ctx.reply('⏰ Checkout session expire hoye geche! Abar try korun.');
   }
 
   const user = await getUser(ctx);
@@ -787,24 +753,14 @@ bot.on('text', async (ctx) => {
       );
 
       if (!tx) {
-        return ctx.telegram.editMessageText(
-          ctx.chat.id,
-          waitMsg.message_id,
-          null,
-          '❌ Ei Order ID-te kono payment pawa jayni! Payment korar 5-10 second por sothik Transfer Order ID-ti send korun.'
-        );
+        return ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, '❌ Ei Order ID-te kono payment pawa jayni!');
       }
 
       const paidAmount = parseFloat(tx.amount);
 
       if (session.type === 'product') {
         if (paidAmount < session.totalUsd) {
-          return ctx.telegram.editMessageText(
-            ctx.chat.id,
-            waitMsg.message_id,
-            null,
-            `❌ Apni kom amount pathiyechen! Dorkar ${session.totalUsd.toFixed(2)} USDT, pawa geche ${paidAmount.toFixed(2)} USDT.`
-          );
+          return ctx.telegram.editMessageText(ctx.chat.id, waitMsg.message_id, null, `❌ Kom amount pathiyechen! Dorkar $${session.totalUsd.toFixed(2)} USDT.`);
         }
 
         await supabase.from('payments').insert([{ trx_id: trxKey, amount: paidAmount, sender: 'Binance', is_used: true }]);
@@ -849,19 +805,15 @@ bot.on('text', async (ctx) => {
     const trxId = rawText.replace(/\s+/g, '').toUpperCase();
     const { data: payment } = await supabase.from('payments').select('*').eq('trx_id', trxId).single();
 
-    if (!payment) {
-      return ctx.reply('⏳ Ei bKash TrxID-ti ekhono system-e asheni. Send Money korar 5-10 second por abar TrxID-ti send korun.');
-    }
-    if (payment.is_used) {
-      return ctx.reply('❌ Ei bKash TrxID-ti already use kora hoyeche!');
-    }
+    if (!payment) return ctx.reply('⏳ Ei bKash TrxID-ti ekhono system-e asheni.');
+    if (payment.is_used) return ctx.reply('❌ Ei bKash TrxID-ti already use kora hoyeche!');
 
     const rate = parseFloat(process.env.USD_TO_BDT_RATE || 130);
     const paidUsd = parseFloat((payment.amount / rate).toFixed(2));
 
     if (session.type === 'product') {
       if (payment.amount < session.totalBdt) {
-        return ctx.reply(`❌ Apni kom taka pathiyechen! Dorkar ${session.totalBdt} BDT, pawa geche ${payment.amount} BDT.`);
+        return ctx.reply(`❌ Kom taka pathiyechen! Dorkar ${session.totalBdt} BDT.`);
       }
 
       await supabase.from('payments').update({ is_used: true }).eq('trx_id', trxId);
@@ -882,10 +834,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply(result.message);
       }
 
-      return ctx.reply(result.message, {
-        parse_mode: 'HTML',
-        ...result.keyboard
-      });
+      return ctx.reply(result.message, { parse_mode: 'HTML', ...result.keyboard });
     } else {
       await supabase.from('payments').update({ is_used: true }).eq('trx_id', trxId);
       pendingCheckouts.delete(ctx.from.id);
@@ -898,9 +847,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ==========================================
-// 11. Safe Server & Webhook Setup
-// ==========================================
 app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7!'));
 app.use(bot.webhookCallback('/telegram-webhook'));
 bot.catch((err) => console.error('Bot Error:', err));
