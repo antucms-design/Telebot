@@ -28,7 +28,6 @@ bot.telegram.setMyCommands([
 // ==========================================
 function getProductEmoji(name = '') {
   const n = name.toLowerCase();
-  // Jodi age thekei emoji thake tahole ar add korbe na
   if (/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/u.test(name.slice(0, 4))) return '';
   if (n.includes('gemini')) return '✨ ';
   if (n.includes('youtube') || n.includes('yt')) return '▶️ ';
@@ -90,7 +89,7 @@ async function getProductStock(product) {
 }
 
 // ==========================================
-// ORDER DELIVERY (LOCAL + PRODSELLER API)
+// ORDER DELIVERY (LOCAL + PRODSELLER API FIXED)
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
@@ -120,11 +119,18 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
       const apiKey = product.supplier_api_key || supConfig.supplier_api_key;
       const orderUrl = product.supplier_api_url || `${baseUrl}/v1/orders`;
 
+      const parsedProdId = isNaN(product.supplier_product_id)
+        ? product.supplier_product_id
+        : Number(product.supplier_product_id);
+
+      // ProdSeller ও অন্যান্য সব সাপ্লায়ারের জন্য productId এবং product_id দুটোই পাঠানো হচ্ছে
       const response = await axios.post(
         orderUrl,
         {
-          product_id: isNaN(product.supplier_product_id) ? product.supplier_product_id : Number(product.supplier_product_id),
-          quantity: qty
+          productId: parsedProdId,
+          product_id: parsedProdId,
+          quantity: Number(qty),
+          qty: Number(qty)
         },
         {
           headers: {
@@ -136,14 +142,33 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
       );
 
       const resData = response.data;
-      const rawItems = resData.data || resData.items || resData.keys || resData.links || resData.accounts || resData.code || resData.link || resData.order?.items || resData.order?.data;
+      const rawItems =
+        resData.data ||
+        resData.items ||
+        resData.keys ||
+        resData.links ||
+        resData.accounts ||
+        resData.code ||
+        resData.link ||
+        resData.content ||
+        resData.delivery ||
+        resData.order?.items ||
+        resData.order?.data ||
+        resData.order?.keys ||
+        resData.order?.content;
       
       if (!rawItems) throw new Error('Empty delivery from supplier');
 
       if (Array.isArray(rawItems)) {
-        deliveredItems = rawItems.map(item => (typeof item === 'object' ? (item.data || item.key || item.link || item.code || JSON.stringify(item)) : item));
+        deliveredItems = rawItems.map(item =>
+          typeof item === 'object'
+            ? item.data || item.key || item.link || item.code || item.content || item.account || JSON.stringify(item)
+            : item
+        );
       } else if (typeof rawItems === 'object') {
-        deliveredItems = [rawItems.data || rawItems.key || rawItems.link || JSON.stringify(rawItems)];
+        deliveredItems = [
+          rawItems.data || rawItems.key || rawItems.link || rawItems.content || JSON.stringify(rawItems)
+        ];
       } else {
         deliveredItems = [String(rawItems)];
       }
@@ -251,7 +276,6 @@ async function showCatalog(ctx, isEdit = true) {
   }
 
   const catList = Object.values(categories);
-  // Stock thaka product gulo upore ebong 0 stock gulo niche thakbe
   catList.sort((a, b) => (b.totalStock > 0 ? 1 : 0) - (a.totalStock > 0 ? 1 : 0));
 
   const buttons = [];
@@ -697,7 +721,6 @@ bot.command('sync', async (ctx) => {
       const basePrice = parseFloat(item.price ?? item.cost ?? 1.0);
       const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
       
-      // Real Stock Detection from Prodseller API
       const rawStock = item.stock ?? item.in_stock ?? item.stock_count ?? item.available ?? item.quantity ?? item.count;
       let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 50;
       if (isNaN(stock) || stock < 0) stock = 0;
