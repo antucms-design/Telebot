@@ -28,7 +28,7 @@ bot.telegram.setMyCommands([
 
 // ==========================================
 // NATIVE TELEGRAM COLORED BUTTON BUILDER
-// styles: 'success' (Green), 'danger' (Red), 'primary' (Blue), null (Default Dark)
+// styles: 'success' (Green), 'danger' (Red), 'primary' (Blue)
 // ==========================================
 function cBtn(text, callback_data, style = null, customEmojiId = null) {
   const btn = { text, callback_data };
@@ -53,7 +53,7 @@ function kbMarkup(inline_keyboard) {
 }
 
 // ==========================================
-// SMART EMOJI & THEME HELPERS
+// SMART EMOJI & HELPERS
 // ==========================================
 function getProductEmoji(productOrName = '', customEmoji = '') {
   if (customEmoji && customEmoji.trim() !== '') return customEmoji.trim() + ' ';
@@ -98,7 +98,6 @@ async function renderScreen(ctx, text, keyboardObj, imageUrl = null, isEdit = tr
       return await ctx.reply(text, extra);
     }
   } catch (err) {
-    // Fallback if Telegram client/API rejects custom button style or emoji id
     try {
       const strippedKb = keyboardObj?.reply_markup?.inline_keyboard?.map(row =>
         row.map(({ style, icon_custom_emoji_id, ...rest }) => rest)
@@ -145,16 +144,21 @@ async function getSupplierConfig() {
   };
 }
 
+// EXACT ZERO-SAFE STOCK CHECKER
 async function getProductStock(product) {
   if (product.type === 'api') {
-    return product.api_stock !== null && product.api_stock !== undefined ? Number(product.api_stock) : 0;
+    const s = Number(product.api_stock);
+    return Number.isNaN(s) ? 0 : s;
   }
+  // Jodi local product-e api_stock manually dewa thake (dashboard theke), seta-o check korbe
   const { count } = await supabase
     .from('stock')
     .select('*', { count: 'exact', head: true })
     .eq('product_id', product.id)
     .eq('is_sold', false);
-  return count || 0;
+  if (count && count > 0) return count;
+  const manualStock = Number(product.api_stock);
+  return Number.isNaN(manualStock) ? 0 : manualStock;
 }
 
 // ==========================================
@@ -204,8 +208,8 @@ async function runSupplierSync() {
     const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
     
     const rawStock = item.stock ?? item.in_stock ?? item.stock_count ?? item.available ?? item.quantity ?? item.count;
-    let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 50;
-    if (isNaN(stock) || stock < 0) stock = 0;
+    let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 0;
+    if (Number.isNaN(stock) || stock < 0) stock = 0;
 
     const desc = item.description || item.details || 'Automatically fulfilled through Nexas Cloud Store.';
 
@@ -384,7 +388,8 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   }
 
   const newSold = Number(product.sold_count || 0) + Number(qty);
-  const newApiStock = product.type === 'api' && product.api_stock >= qty ? product.api_stock - qty : product.api_stock;
+  const currentStock = Number(product.api_stock || 0);
+  const newApiStock = currentStock >= qty ? currentStock - qty : 0;
   await supabase.from('products').update({ sold_count: newSold, api_stock: newApiStock }).eq('id', product.id);
 
   const orderId = 'ORD-' + Date.now() + Math.floor(10 + Math.random() * 90);
@@ -485,7 +490,6 @@ async function showCatalog(ctx, isEdit = true) {
   }
 
   const catList = Object.values(categories);
-  // In-stock (Green) upore thakbe, Out-of-stock (Red) niche thakbe
   catList.sort((a, b) => (b.totalStock > 0 ? 1 : 0) - (a.totalStock > 0 ? 1 : 0));
 
   const buttons = [];
@@ -494,7 +498,7 @@ async function showCatalog(ctx, isEdit = true) {
     const c1 = catList[i];
     const hasCustomIcon1 = c1.firstProd.custom_emoji_id && String(c1.firstProd.custom_emoji_id).trim() !== '';
     const emoji1 = hasCustomIcon1 ? '' : getProductEmoji(c1.firstProd);
-    const style1 = c1.totalStock > 0 ? 'success' : 'danger'; // GREEN if stock > 0, RED if 0!
+    const style1 = c1.totalStock > 0 ? 'success' : 'danger';
     row.push(cBtn(`${emoji1}${c1.name} (${c1.totalStock})`, `cat_${c1.firstProd.id}`, style1, c1.firstProd.custom_emoji_id));
 
     if (catList[i + 1]) {
@@ -523,7 +527,7 @@ bot.action('menu_shop', (ctx) => { ctx.answerCbQuery(); showCatalog(ctx, true); 
 bot.command('products', (ctx) => showCatalog(ctx, false));
 
 // ==========================================
-// 3. Category View & Variants (GREEN / RED Buttons)
+// 3. Category View & Variants
 // ==========================================
 bot.action(/cat_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
@@ -567,7 +571,7 @@ bot.action(/cat_(\d+)/, async (ctx) => {
 });
 
 // ==========================================
-// 4. Excalibur-Style Product Card (Colored Buttons!)
+// 4. Excalibur-Style Product Card
 // ==========================================
 async function showProductView(ctx, prodId, qty = 1, isEdit = true, fromCatalog = false) {
   pendingCheckouts.delete(ctx.from.id);
@@ -607,7 +611,6 @@ async function showProductView(ctx, prodId, qty = 1, isEdit = true, fromCatalog 
 
   const backAction = fromCatalog ? 'menu_shop' : `cat_${prodId}`;
 
-  // Buy button GREEN if stock > 0, RED if stock == 0!
   const buyButton = stock > 0
     ? cBtn(`✅ Buy (Total: $${totalPrice})`, `paymenu_${prodId}_${qty}`, 'success')
     : cBtn(`❌ Out of Stock ($${totalPrice})`, `noop_out`, 'danger');
@@ -1128,7 +1131,7 @@ bot.on('text', async (ctx) => {
 });
 
 // ==========================================
-// 11. UPGRADED WEB ADMIN DASHBOARD (/admin)
+// 11. UPGRADED WEB ADMIN DASHBOARD (/admin) — ZERO STOCK BUG FIXED!
 // ==========================================
 function verifyAdminReq(req, res, next) {
   const pass = req.headers['x-admin-password'] || req.query.pass || req.body?.password;
@@ -1156,8 +1159,8 @@ app.post('/api/admin/settings', verifyAdminReq, async (req, res) => {
     store_name,
     supplier_base_url: (supplier_base_url || '').replace(/\/$/, ''),
     supplier_api_key,
-    profit_margin: parseFloat(profit_margin || 20),
-    usd_to_bdt_rate: parseFloat(usd_to_bdt_rate || 130),
+    profit_margin: Number.isNaN(Number(profit_margin)) ? 20 : Number(profit_margin),
+    usd_to_bdt_rate: Number.isNaN(Number(usd_to_bdt_rate)) ? 130 : Number(usd_to_bdt_rate),
     bkash_number,
     binance_pay_id,
     support_username,
@@ -1177,34 +1180,62 @@ app.post('/api/admin/sync', verifyAdminReq, async (req, res) => {
   }
 });
 
+// ZERO-SAFE PRODUCT UPDATE ROUTE (WITH FALLBACK IF COLUMNS MISSING)
 app.post('/api/admin/product/update', verifyAdminReq, async (req, res) => {
   const { id, emoji, custom_emoji_id, category, name, price, api_stock, sold_count, image_url, description } = req.body;
-  const { error } = await supabase.from('products').update({
+
+  const parsedPrice = Number.isNaN(Number(price)) ? 0 : Number(price);
+  const parsedStock = api_stock === '' || api_stock === null || api_stock === undefined || Number.isNaN(Number(api_stock)) ? 0 : parseInt(api_stock, 10);
+  const parsedSold = sold_count === '' || sold_count === null || sold_count === undefined || Number.isNaN(Number(sold_count)) ? 0 : parseInt(sold_count, 10);
+
+  const fullPayload = {
     emoji: emoji || '',
     custom_emoji_id: custom_emoji_id || '',
-    category,
-    name,
-    price: parseFloat(price || 0),
-    api_stock: parseInt(api_stock || 0),
-    sold_count: parseInt(sold_count || 0),
+    category: category || '',
+    name: name || '',
+    price: parsedPrice,
+    api_stock: parsedStock,
+    sold_count: parsedSold,
     image_url: image_url || '',
     description: description || ''
-  }).eq('id', id);
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ success: true });
+  };
+
+  let { error } = await supabase.from('products').update(fullPayload).eq('id', Number(id));
+
+  // Jodi user Supabase-e notun column add na kore thake, tahole core columns update korbe jate stock 0 save hoy!
+  if (error) {
+    const basicPayload = {
+      category: category || '',
+      name: name || '',
+      price: parsedPrice,
+      api_stock: parsedStock,
+      description: description || ''
+    };
+    const retry = await supabase.from('products').update(basicPayload).eq('id', Number(id));
+    if (retry.error) return res.status(400).json({ error: retry.error.message });
+  }
+
+  // Jodi local product hoy ebong stock 0 kora hoy, tahole local stock-o clear kore dibe
+  if (parsedStock === 0) {
+    await supabase.from('stock').update({ is_sold: true }).eq('product_id', Number(id));
+  }
+
+  res.json({ success: true, saved_stock: parsedStock });
 });
 
 app.post('/api/admin/product/add', verifyAdminReq, async (req, res) => {
   const { emoji, custom_emoji_id, category, name, price, description, type, api_stock, image_url } = req.body;
+  const parsedStock = api_stock === '' || api_stock === undefined || Number.isNaN(Number(api_stock)) ? 0 : parseInt(api_stock, 10);
+
   const { error } = await supabase.from('products').insert([{
     emoji: emoji || '💥',
     custom_emoji_id: custom_emoji_id || '',
     category,
     name,
-    price: parseFloat(price || 1),
+    price: Number.isNaN(Number(price)) ? 1 : Number(price),
     description: description || 'Automatically fulfilled through Nexas Cloud Store.',
-    type: type || 'local',
-    api_stock: parseInt(api_stock || 10),
+    type: type || 'api',
+    api_stock: parsedStock,
     image_url: image_url || '',
     sold_count: 0
   }]);
@@ -1220,7 +1251,7 @@ app.post('/api/admin/product/delete', verifyAdminReq, async (req, res) => {
 
 app.post('/api/admin/user/balance', verifyAdminReq, async (req, res) => {
   const { telegram_id, balance } = req.body;
-  const { error } = await supabase.from('users').update({ balance: parseFloat(balance) }).eq('telegram_id', telegram_id);
+  const { error } = await supabase.from('users').update({ balance: parseFloat(balance || 0) }).eq('telegram_id', telegram_id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ success: true });
 });
@@ -1354,7 +1385,7 @@ app.get('/admin', (req, res) => {
     <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4 mb-6">
       <div>
         <h1 class="text-2xl font-bold text-white">⚡ Nexas Store Visual Customizer</h1>
-        <p class="text-xs text-slate-400"> Stock > 0 = 🟢 Green Button | Stock 0 = 🔴 Red Button in Telegram</p>
+        <p class="text-xs text-slate-400">Stock > 0 = 🟢 Green Button | Stock 0 = 🔴 Red Button in Telegram</p>
       </div>
       <div class="flex gap-2">
         <button onclick="syncNow()" id="syncBtn" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
@@ -1575,7 +1606,7 @@ app.get('/admin', (req, res) => {
 
       const pBody = document.getElementById('productsTable');
       pBody.innerHTML = filtered.map(p => {
-        const stock = Number(p.api_stock ?? 0);
+        const stock = p.api_stock === null || p.api_stock === undefined ? 0 : Number(p.api_stock);
         const badge = stock > 0
           ? '<span class="px-2 py-0.5 rounded bg-emerald-600 text-white font-bold">🟢 In Stock</span>'
           : '<span class="px-2 py-0.5 rounded bg-rose-700 text-white font-bold">🔴 Out (0)</span>';
@@ -1607,7 +1638,7 @@ app.get('/admin', (req, res) => {
       document.getElementById('m_custom_emoji').value = p.custom_emoji_id || '';
       document.getElementById('m_cat').value = p.category || '';
       document.getElementById('m_name').value = p.name || '';
-      document.getElementById('m_price').value = p.price || 0;
+      document.getElementById('m_price').value = p.price ?? 0;
       document.getElementById('m_stock').value = p.api_stock ?? 0;
       document.getElementById('m_sold').value = p.sold_count ?? 0;
       document.getElementById('m_img').value = p.image_url || '';
@@ -1625,8 +1656,9 @@ app.get('/admin', (req, res) => {
       const cat = document.getElementById('m_cat').value || 'Category';
       const name = document.getElementById('m_name').value || 'Product Name';
       const price = Number(document.getElementById('m_price').value || 0).toFixed(2);
-      const stock = Number(document.getElementById('m_stock').value || 0);
-      const sold = document.getElementById('m_sold').value || 0;
+      const rawStock = document.getElementById('m_stock').value;
+      const stock = rawStock === '' ? 0 : Number(rawStock);
+      const sold = Number(document.getElementById('m_sold').value || 0);
       const img = document.getElementById('m_img').value.trim();
       const desc = document.getElementById('m_desc').value || 'Automatically fulfilled through Nexas Cloud Store.';
 
@@ -1664,55 +1696,68 @@ app.get('/admin', (req, res) => {
     }
 
     async function saveModalProduct() {
-      const id = Number(document.getElementById('m_id').value);
-      await api('/api/admin/product/update', 'POST', {
-        id,
-        emoji: document.getElementById('m_emoji').value,
-        custom_emoji_id: document.getElementById('m_custom_emoji').value,
-        category: document.getElementById('m_cat').value,
-        name: document.getElementById('m_name').value,
-        price: document.getElementById('m_price').value,
-        api_stock: document.getElementById('m_stock').value,
-        sold_count: document.getElementById('m_sold').value,
-        image_url: document.getElementById('m_img').value,
-        description: document.getElementById('m_desc').value
-      });
-      closeModal();
-      loadData();
+      try {
+        const id = Number(document.getElementById('m_id').value);
+        await api('/api/admin/product/update', 'POST', {
+          id,
+          emoji: document.getElementById('m_emoji').value,
+          custom_emoji_id: document.getElementById('m_custom_emoji').value,
+          category: document.getElementById('m_cat').value,
+          name: document.getElementById('m_name').value,
+          price: document.getElementById('m_price').value,
+          api_stock: document.getElementById('m_stock').value,
+          sold_count: document.getElementById('m_sold').value,
+          image_url: document.getElementById('m_img').value,
+          description: document.getElementById('m_desc').value
+        });
+        closeModal();
+        await loadData();
+        alert('✅ Product Saved Successfully!');
+      } catch (e) {
+        alert('❌ Save Error: ' + e.message);
+      }
     }
 
     async function quickSaveProd(id) {
-      const p = ALL_PRODUCTS.find(x => x.id === id);
-      await api('/api/admin/product/update', 'POST', {
-        id,
-        emoji: document.getElementById('p_emoji_' + id).value,
-        custom_emoji_id: p?.custom_emoji_id || '',
-        category: document.getElementById('p_cat_' + id).value,
-        name: document.getElementById('p_name_' + id).value,
-        price: document.getElementById('p_price_' + id).value,
-        api_stock: document.getElementById('p_stock_' + id).value,
-        sold_count: p?.sold_count ?? 0,
-        image_url: p?.image_url || '',
-        description: p?.description || ''
-      });
-      alert('✅ Saved!');
-      loadData();
+      try {
+        const p = ALL_PRODUCTS.find(x => x.id === id);
+        await api('/api/admin/product/update', 'POST', {
+          id,
+          emoji: document.getElementById('p_emoji_' + id).value,
+          custom_emoji_id: p?.custom_emoji_id || '',
+          category: document.getElementById('p_cat_' + id).value,
+          name: document.getElementById('p_name_' + id).value,
+          price: document.getElementById('p_price_' + id).value,
+          api_stock: document.getElementById('p_stock_' + id).value,
+          sold_count: p?.sold_count ?? 0,
+          image_url: p?.image_url || '',
+          description: p?.description || ''
+        });
+        await loadData();
+        alert('✅ Stock & Product Saved!');
+      } catch (e) {
+        alert('❌ Save Error: ' + e.message);
+      }
     }
 
     async function saveSettings() {
-      await api('/api/admin/settings', 'POST', {
-        store_name: document.getElementById('s_store_name').value,
-        default_banner: document.getElementById('s_banner').value,
-        support_username: document.getElementById('s_support').value,
-        bkash_number: document.getElementById('s_bkash').value,
-        binance_pay_id: document.getElementById('s_binance').value,
-        usd_to_bdt_rate: document.getElementById('s_rate').value,
-        profit_margin: document.getElementById('s_margin').value,
-        supplier_base_url: document.getElementById('s_url').value,
-        supplier_api_key: document.getElementById('s_key').value
-      });
-      alert('✅ Store Settings Saved!');
-      loadData();
+      try {
+        await api('/api/admin/settings', 'POST', {
+          store_name: document.getElementById('s_store_name').value,
+          default_banner: document.getElementById('s_banner').value,
+          support_username: document.getElementById('s_support').value,
+          bkash_number: document.getElementById('s_bkash').value,
+          binance_pay_id: document.getElementById('s_binance').value,
+          usd_to_bdt_rate: document.getElementById('s_rate').value,
+          profit_margin: document.getElementById('s_margin').value,
+          supplier_base_url: document.getElementById('s_url').value,
+          supplier_api_key: document.getElementById('s_key').value
+        });
+        alert('✅ Store Settings Saved!');
+        loadData();
+      } catch (e) {
+        alert('❌ Error: ' + e.message);
+      }
     }
 
     async function syncNow() {
@@ -1735,18 +1780,22 @@ app.get('/admin', (req, res) => {
     }
 
     async function addProduct() {
-      await api('/api/admin/product/add', 'POST', {
-        emoji: document.getElementById('n_emoji').value,
-        category: document.getElementById('n_cat').value,
-        name: document.getElementById('n_name').value,
-        price: document.getElementById('n_price').value,
-        api_stock: document.getElementById('n_stock').value,
-        image_url: document.getElementById('n_img').value,
-        description: document.getElementById('n_desc').value,
-        type: 'api'
-      });
-      alert('✅ Product Created!');
-      loadData();
+      try {
+        await api('/api/admin/product/add', 'POST', {
+          emoji: document.getElementById('n_emoji').value,
+          category: document.getElementById('n_cat').value,
+          name: document.getElementById('n_name').value,
+          price: document.getElementById('n_price').value,
+          api_stock: document.getElementById('n_stock').value,
+          image_url: document.getElementById('n_img').value,
+          description: document.getElementById('n_desc').value,
+          type: 'api'
+        });
+        alert('✅ Product Created!');
+        loadData();
+      } catch (e) {
+        alert('❌ Error: ' + e.message);
+      }
     }
 
     async function saveBal(tgId) {
