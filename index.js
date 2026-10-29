@@ -11,9 +11,13 @@ const axios = require('axios');
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const pendingCheckouts = new Map();
+
+// ড্যাশবোর্ডে লগইন করার পাসওয়ার্ড (চাইলে Render Environment-এ ADMIN_PASSWORD যোগ করতে পারেন, না দিলে WEBHOOK_SECRET বা admin123 কাজ করবে)
+const ADMIN_PASS = process.env.ADMIN_PASSWORD || process.env.WEBHOOK_SECRET || 'admin123';
 
 bot.telegram.setMyCommands([
   { command: 'start', description: 'Start and open the menu' },
@@ -24,7 +28,7 @@ bot.telegram.setMyCommands([
 ]).catch(console.error);
 
 // ==========================================
-// SMART EMOJI MAPPER & CATEGORY PARSER
+// SMART EMOJI MAPPER & HELPERS
 // ==========================================
 function getProductEmoji(name = '') {
   const n = name.toLowerCase();
@@ -67,12 +71,18 @@ async function getUser(ctx, startPayload = null) {
   return user;
 }
 
+// ডাটাবেস থেকে সব ডায়নামিক সেটিংস আনা
 async function getSupplierConfig() {
   const { data } = await supabase.from('settings').select('*').eq('id', 1).single();
-  return data || {
-    supplier_base_url: 'https://prodseller.com',
-    supplier_api_key: 'psk_701f79a0c971f198abbcdc3978e5804b2b8b587f239be728',
-    profit_margin: 20
+  return {
+    supplier_base_url: data?.supplier_base_url || 'https://prodseller.com',
+    supplier_api_key: data?.supplier_api_key || 'psk_701f79a0c971f198abbcdc3978e5804b2b8b587f239be728',
+    profit_margin: data?.profit_margin ?? 20,
+    store_name: data?.store_name || 'Nexas Cloud Store',
+    usd_to_bdt_rate: Number(data?.usd_to_bdt_rate || process.env.USD_TO_BDT_RATE || 130),
+    bkash_number: data?.bkash_number || process.env.MY_BKASH_NUMBER || '01708994003',
+    binance_pay_id: data?.binance_pay_id || process.env.BINANCE_PAY_ID || '988336275',
+    support_username: data?.support_username || process.env.SUPPORT_USERNAME || '@mehedihasanantu'
   };
 }
 
@@ -86,6 +96,87 @@ async function getProductStock(product) {
     .eq('product_id', product.id)
     .eq('is_sold', false);
   return count || 0;
+}
+
+// ==========================================
+// REUSABLE SUPPLIER SYNC ENGINE
+// ==========================================
+async function runSupplierSync() {
+  const sup = await getSupplierConfig();
+  const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
+  
+  let res;
+  try {
+    res = await axios.get(`${baseUrl}/v1/products`, {
+      headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+    });
+  } catch (err1) {
+    res = await axios.get(`${baseUrl}/api/v1/products`, {
+      headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
+    });
+  }
+
+  const list = Array.isArray(res.data) ? res.data : (res.data.products || res.data.data || []);
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error('Supplier theke kono product pawa jayni.');
+  }
+
+  const margin = parseFloat(sup.profit_margin || 0);
+  const orderEndpoint = `${baseUrl}/v1/orders`;
+  let added = 0;
+  let updated = 0;
+
+  for (const item of list) {
+    const suppId = String(item.id ?? item.product_id ?? item._id);
+    const rawName = (item.name || item.title || 'Digital Product').trim();
+    const emojiPrefix = item.emoji || item.icon ? `${item.emoji || item.icon} ` : '';
+    
+    let category = item.category || item.group || rawName;
+    let planName = item.plan || item.variant || rawName;
+
+    if (!item.category && rawName.includes(' - ')) {
+      const parts = rawName.split(' - ');
+      category = parts[0].trim();
+      planName = parts.slice(1).join(' - ').trim();
+    }
+
+    if (emojiPrefix && !category.startsWith(emojiPrefix.trim())) {
+      category = `${emojiPrefix}${category}`;
+    }
+
+    const basePrice = parseFloat(item.price ?? item.cost ?? 1.0);
+    const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
+    
+    const rawStock = item.stock ?? item.in_stock ?? item.stock_count ?? item.available ?? item.quantity ?? item.count;
+    let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 50;
+    if (isNaN(stock) || stock < 0) stock = 0;
+
+    const desc = item.description || item.details || '• Instant Automated Delivery\n• Activate on your own account';
+
+    const { data: existing } = await supabase
+      .from('products')
+      .select('id')
+      .eq('type', 'api')
+      .eq('supplier_product_id', suppId)
+      .maybeSingle();
+
+    if (existing) {
+      await supabase.from('products').update({
+        category, name: planName, price: sellPrice, description: desc,
+        api_stock: stock, supplier_api_url: orderEndpoint, supplier_api_key: sup.supplier_api_key
+      }).eq('id', existing.id);
+      updated++;
+    } else {
+      await supabase.from('products').insert([{
+        category, name: planName, price: sellPrice, description: desc,
+        type: 'api', api_stock: stock, supplier_api_url: orderEndpoint,
+        supplier_api_key: sup.supplier_api_key, supplier_product_id: suppId
+      }]);
+      added++;
+    }
+  }
+
+  return { added, updated, margin };
 }
 
 // ==========================================
@@ -112,26 +203,22 @@ function extractRealDeliveryItems(obj) {
       const s = val.trim();
       if (!s || ignoreValues.includes(s.toLowerCase())) return;
 
-      // ১. যদি সরাসরি কোনো লিংক (URL) হয়
       if (s.startsWith('http://') || s.startsWith('https://')) {
         results.push(s);
         return;
       }
 
-      // ২. যদি নির্দিষ্ট ডেলিভারি ফিল্ডের ভেতরে থাকে
       const targetKeys = [
         'key', 'keys', 'code', 'codes', 'link', 'links', 'account', 'accounts',
         'credential', 'credentials', 'item', 'items', 'data', 'value', 'secret',
-        'token', 'content', ' delivered', 'stock', 'payload', 'text', 'redeem'
+        'token', 'content', 'delivered', 'stock', 'payload', 'text', 'redeem'
       ];
       if (targetKeys.includes(kLower) && !ignoreKeys.includes(kLower)) {
         results.push(s);
         return;
       }
 
-      // ৩. যদি ইমেইল:পাসওয়ার্ড বা বড় অ্যাক্সেস টোকেন হয় (এবং কোনো সাধারণ আইডি না হয়)
       if (!ignoreKeys.includes(kLower) && (s.includes(':') || s.includes('@') || s.length > 18)) {
-        // ISO Date বাদ দেওয়া
         if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s)) {
           results.push(s);
         }
@@ -140,7 +227,6 @@ function extractRealDeliveryItems(obj) {
       val.forEach(item => scan(item, keyName));
     } else if (typeof val === 'object') {
       for (const [k, v] of Object.entries(val)) {
-        // {"type":"instant"} অবজেক্ট সম্পূর্ণ স্কিপ করবে
         if (k.toLowerCase() === 'delivery' && typeof v === 'object' && v !== null && v.type === 'instant' && Object.keys(v).length === 1) {
           continue;
         }
@@ -156,7 +242,7 @@ function extractRealDeliveryItems(obj) {
 }
 
 // ==========================================
-// ORDER DELIVERY (LOCAL + PRODSELLER API FIXED)
+// ORDER DELIVERY (LOCAL + PRODSELLER API)
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
@@ -208,20 +294,14 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
       );
 
       const resData = response.data;
-      console.log('📦 Supplier Order Response:', JSON.stringify(resData));
-
       deliveredItems = extractRealDeliveryItems(resData);
 
-      // যদি প্রথম রেসপন্সে শুধু Order ID থাকে, তবে GET /v1/orders/:id কল করে আসল লিংক আনা হবে
       const supOrderId = resData.id || resData.orderId || resData.order_id || resData.order?.id || resData.data?.id;
       if (deliveredItems.length === 0 && supOrderId) {
         try {
           const statusRes = await axios.get(`${baseUrl}/v1/orders/${supOrderId}`, { headers });
-          console.log('📦 Supplier Order Status Response:', JSON.stringify(statusRes.data));
           deliveredItems = extractRealDeliveryItems(statusRes.data);
-        } catch (e) {
-          console.error('Order status fetch error:', e.message);
-        }
+        } catch (e) {}
       }
 
       if (deliveredItems.length === 0) {
@@ -280,7 +360,8 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
 async function sendMainMenu(ctx, isEdit = false) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
-  const text = `Welcome to <b>Nexas Cloud Store</b> ❗️\n👋🏻 Hello! ${user.name}\n\n📌 <b>Account Details</b>\n💳 Telegram ID: <code>${user.telegram_id}</code>\n💰 Balance: <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\nChoose below ⬇️`;
+  const cfg = await getSupplierConfig();
+  const text = `Welcome to <b>${cfg.store_name}</b> ❗️\n👋🏻 Hello! ${user.name}\n\n📌 <b>Account Details</b>\n💳 Telegram ID: <code>${user.telegram_id}</code>\n💰 Balance: <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\nChoose below ⬇️`;
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Cloud Store Catalog', 'menu_shop'), Markup.button.callback('💰 Wallet', 'menu_wallet')],
@@ -298,7 +379,7 @@ bot.command('menu', (ctx) => sendMainMenu(ctx, false));
 bot.action('main_menu', (ctx) => { ctx.answerCbQuery(); sendMainMenu(ctx, true); });
 
 // ==========================================
-// 2. Cloud Store Catalog (With Brand Emoji + Real Stock)
+// 2. Cloud Store Catalog
 // ==========================================
 async function showCatalog(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
@@ -315,19 +396,9 @@ async function showCatalog(ctx, isEdit = true) {
     const catName = p.category || p.name;
     const stock = await getProductStock(p);
     if (!categories[catName]) {
-      categories[catName] = {
-        name: catName,
-        totalStock: 0,
-        firstProdId: p.id,
-        planCount: 0,
-        minPrice: Number(p.price)
-      };
+      categories[catName] = { name: catName, totalStock: 0, firstProdId: p.id };
     }
     categories[catName].totalStock += stock;
-    categories[catName].planCount += 1;
-    if (Number(p.price) < categories[catName].minPrice) {
-      categories[catName].minPrice = Number(p.price);
-    }
   }
 
   const catList = Object.values(categories);
@@ -454,8 +525,9 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
   }
 
   ctx.answerCbQuery();
+  const cfg = await getSupplierConfig();
   const totalUsd = Number((Number(product.price) * qty).toFixed(2));
-  const rate = parseFloat(process.env.USD_TO_BDT_RATE || 130);
+  const rate = cfg.usd_to_bdt_rate;
   const totalBdt = Math.ceil(totalUsd * rate);
   const emoji = getProductEmoji(product.category || product.name);
 
@@ -481,7 +553,7 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `🟡 <b>HOW TO PAY ON BINANCE:</b>\n` +
       `1️⃣ Open your <b>Binance App</b>\n` +
       `2️⃣ Go to <b>Pay ➔ Send</b>\n` +
-      `3️⃣ Send to Binance ID: <code>${process.env.BINANCE_PAY_ID}</code> <i>(Tap to copy)</i>\n` +
+      `3️⃣ Send to Binance ID: <code>${cfg.binance_pay_id}</code> <i>(Tap to copy)</i>\n` +
       `4️⃣ Send EXACT amount: <code>${totalUsd.toFixed(2)} USDT</code>\n\n` +
       `✅ <b>AFTER PAYING:</b>\n` +
       `Send your <b>Order ID</b> directly in this chat to receive your item instantly!\n` +
@@ -507,7 +579,7 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `📱 <b>HOW TO PAY ON BKASH:</b>\n` +
       `1️⃣ Open your <b>bKash App</b>\n` +
       `2️⃣ Go to <b>Send Money</b>\n` +
-      `3️⃣ Send to Personal Number: <code>${process.env.MY_BKASH_NUMBER}</code> <i>(Tap to copy)</i>\n` +
+      `3️⃣ Send to Personal Number: <code>${cfg.bkash_number}</code> <i>(Tap to copy)</i>\n` +
       `4️⃣ Send EXACT amount: <code>${totalBdt} BDT</code>\n\n` +
       `✅ <b>AFTER PAYING:</b>\n` +
       `Send your <b>bKash TrxID</b> directly in this chat to receive your item instantly!\n` +
@@ -582,21 +654,22 @@ async function showWallet(ctx, isEdit = true) {
 bot.action('menu_wallet', (ctx) => { ctx.answerCbQuery(); showWallet(ctx, true); });
 bot.command('wallet', (ctx) => showWallet(ctx, false));
 
-bot.action('dep_binance', (ctx) => {
+bot.action('dep_binance', async (ctx) => {
   ctx.answerCbQuery();
+  const cfg = await getSupplierConfig();
   pendingCheckouts.set(ctx.from.id, { type: 'wallet', method: 'binance', expiresAt: Date.now() + 10 * 60 * 1000 });
   ctx.editMessageText(
-    `🟡 <b>WALLET DEPOSIT - BINANCE PAY</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Open Binance App ➔ <b>Pay ➔ Send</b>\n2️⃣ Send USDT to Binance ID: <code>${process.env.BINANCE_PAY_ID}</code>\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>Transfer Order ID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your Order ID •••</b>`,
+    `🟡 <b>WALLET DEPOSIT - BINANCE PAY</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Open Binance App ➔ <b>Pay ➔ Send</b>\n2️⃣ Send USDT to Binance ID: <code>${cfg.binance_pay_id}</code>\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>Transfer Order ID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your Order ID •••</b>`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]) }
   );
 });
 
-bot.action('dep_bkash', (ctx) => {
+bot.action('dep_bkash', async (ctx) => {
   ctx.answerCbQuery();
-  const rate = process.env.USD_TO_BDT_RATE || 130;
+  const cfg = await getSupplierConfig();
   pendingCheckouts.set(ctx.from.id, { type: 'wallet', method: 'bkash', expiresAt: Date.now() + 10 * 60 * 1000 });
   ctx.editMessageText(
-    `📱 <b>WALLET DEPOSIT - PERSONAL BKASH</b>\n━━━━━━━━━━━━━━━━━━━━\n📞 <b>bKash Number:</b> <code>${process.env.MY_BKASH_NUMBER}</code>\n💱 <b>Rate:</b> $1 = ${rate} BDT\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>bKash TrxID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your TrxID •••</b>`,
+    `📱 <b>WALLET DEPOSIT - PERSONAL BKASH</b>\n━━━━━━━━━━━━━━━━━━━━\n📞 <b>bKash Number:</b> <code>${cfg.bkash_number}</code>\n💱 <b>Rate:</b> $1 = ${cfg.usd_to_bdt_rate} BDT\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>bKash TrxID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your TrxID •••</b>`,
     { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]) }
   );
 });
@@ -656,9 +729,10 @@ bot.action('menu_profile', async (ctx) => {
   });
 });
 
-bot.action('menu_support', (ctx) => {
+bot.action('menu_support', async (ctx) => {
   ctx.answerCbQuery();
-  ctx.editMessageText(`🛟 Support: ${process.env.SUPPORT_USERNAME}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  const cfg = await getSupplierConfig();
+  ctx.editMessageText(`🛟 Support: ${cfg.support_username}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
 });
 
 bot.action('menu_recover', (ctx) => {
@@ -675,7 +749,7 @@ bot.command('recover', async (ctx) => {
 });
 
 // ==========================================
-// 9. ADMIN COMMANDS: SUPPLIER MANAGER & REAL STOCK SYNC
+// 9. ADMIN COMMANDS (TELEGRAM)
 // ==========================================
 function isAdmin(ctx) { return String(ctx.from.id) === String(process.env.ADMIN_ID); }
 
@@ -693,22 +767,19 @@ bot.command('supplier', async (ctx) => {
     balText = 'Could not fetch balance';
   }
 
+  const appUrl = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
   ctx.reply(
-    `⚙️ <b>CURRENT SUPPLIER SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚙️ <b>CURRENT SUPPLIER & STORE SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `🏪 <b>Store Name:</b> ${sup.store_name}\n` +
     `🌐 <b>Base URL:</b> <code>${sup.supplier_base_url}</code>\n` +
-    `🔑 <b>API Key:</b> <code>${sup.supplier_api_key}</code>\n` +
     `📈 <b>Profit Margin:</b> <code>${sup.profit_margin}%</code>\n` +
+    `💱 <b>USD Rate:</b> <code>${sup.usd_to_bdt_rate} BDT</code>\n` +
     `💰 <b>Supplier Balance:</b> <b>${balText}</b>\n\n` +
-    `📌 <b>Useful Admin Commands:</b>\n` +
-    `• <code>/sync</code> — Auto-import/update all products\n` +
-    `• <code>/lastorders</code> — Check supplier recent orders & links\n` +
-    `• <code>/setsupplier URL | API_KEY | PROFIT%</code> — Change supplier anytime\n` +
-    `• <code>/clearapi</code> — Delete all API products`,
+    `🖥️ <b>Web Admin Dashboard:</b>\n${appUrl ? `${appUrl}/admin` : ' `/admin` route on your server'}`,
     { parse_mode: 'HTML' }
   );
 });
 
-// সাপ্লায়ার থেকে সর্বশেষ অর্ডারের আসল ডাটা ও লিংক দেখার কমান্ড (/lastorders)
 bot.command('lastorders', async (ctx) => {
   if (!isAdmin(ctx)) return;
   try {
@@ -739,112 +810,14 @@ bot.command('setsupplier', async (ctx) => {
     profit_margin: parseFloat(margin)
   }]);
 
-  ctx.reply(`✅ <b>Supplier Updated Successfully!</b>\n\n🌐 URL: <code>${url}</code>\n📈 Profit Margin: <b>${margin}%</b>\n\nEkhon <code>/sync</code> command din!`, { parse_mode: 'HTML' });
+  ctx.reply(`✅ <b>Supplier Updated!</b> Ekhon <code>/sync</code> command din!`, { parse_mode: 'HTML' });
 });
 
 bot.command('sync', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const wait = await ctx.reply('🔄 <b>Syncing products & real stock from supplier...</b>', { parse_mode: 'HTML' });
-
   try {
-    const sup = await getSupplierConfig();
-    const baseUrl = sup.supplier_base_url.replace(/\/$/, '');
-    
-    let res;
-    try {
-      res = await axios.get(`${baseUrl}/v1/products`, {
-        headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
-      });
-    } catch (err1) {
-      res = await axios.get(`${baseUrl}/api/v1/products`, {
-        headers: { 'X-API-Key': sup.supplier_api_key, 'Authorization': `Bearer ${sup.supplier_api_key}` }
-      });
-    }
-
-    const list = Array.isArray(res.data) ? res.data : (res.data.products || res.data.data || []);
-    if (!Array.isArray(list) || list.length === 0) {
-      return ctx.telegram.editMessageText(ctx.chat.id, wait.message_id, null, '❌ Supplier theke kono product pawa jayni.');
-    }
-
-    const margin = parseFloat(sup.profit_margin || 0);
-    const orderEndpoint = `${baseUrl}/v1/orders`;
-    let added = 0;
-    let updated = 0;
-    let dbErrorMsg = null;
-
-    for (const item of list) {
-      const suppId = String(item.id ?? item.product_id ?? item._id);
-      const rawName = (item.name || item.title || 'Digital Product').trim();
-      const emojiPrefix = item.emoji || item.icon ? `${item.emoji || item.icon} ` : '';
-      
-      let category = item.category || item.group || rawName;
-      let planName = item.plan || item.variant || rawName;
-
-      if (!item.category && rawName.includes(' - ')) {
-        const parts = rawName.split(' - ');
-        category = parts[0].trim();
-        planName = parts.slice(1).join(' - ').trim();
-      }
-
-      if (emojiPrefix && !category.startsWith(emojiPrefix.trim())) {
-        category = `${emojiPrefix}${category}`;
-      }
-
-      const basePrice = parseFloat(item.price ?? item.cost ?? 1.0);
-      const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
-      
-      const rawStock = item.stock ?? item.in_stock ?? item.stock_count ?? item.available ?? item.quantity ?? item.count;
-      let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 50;
-      if (isNaN(stock) || stock < 0) stock = 0;
-
-      const desc = item.description || item.details || '• Instant Automated Delivery\n• Activate on your own account';
-
-      const { data: existing } = await supabase
-        .from('products')
-        .select('id')
-        .eq('type', 'api')
-        .eq('supplier_product_id', suppId)
-        .maybeSingle();
-
-      if (existing) {
-        const { error: upErr } = await supabase.from('products').update({
-          category,
-          name: planName,
-          price: sellPrice,
-          description: desc,
-          api_stock: stock,
-          supplier_api_url: orderEndpoint,
-          supplier_api_key: sup.supplier_api_key
-        }).eq('id', existing.id);
-        if (upErr) dbErrorMsg = upErr.message;
-        else updated++;
-      } else {
-        const { error: inErr } = await supabase.from('products').insert([{
-          category,
-          name: planName,
-          price: sellPrice,
-          description: desc,
-          type: 'api',
-          api_stock: stock,
-          supplier_api_url: orderEndpoint,
-          supplier_api_key: sup.supplier_api_key,
-          supplier_product_id: suppId
-        }]);
-        if (inErr) dbErrorMsg = inErr.message;
-        else added++;
-      }
-    }
-
-    if (added === 0 && updated === 0 && dbErrorMsg) {
-      return ctx.telegram.editMessageText(
-        ctx.chat.id,
-        wait.message_id,
-        null,
-        `❌ <b>Database Column Missing Error:</b>\n<code>${dbErrorMsg}</code>\n\nSupabase SQL Editor-e giye <code>category</code> ebong <code>api_stock</code> column add korun!`,
-        { parse_mode: 'HTML' }
-      );
-    }
-
+    const { added, updated, margin } = await runSupplierSync();
     ctx.telegram.editMessageText(
       ctx.chat.id,
       wait.message_id,
@@ -923,6 +896,7 @@ bot.on('text', async (ctx) => {
   }
 
   const user = await getUser(ctx);
+  const cfg = await getSupplierConfig();
 
   if (session.method === 'binance') {
     const orderId = rawText.replace(/\s+/g, '');
@@ -1002,7 +976,7 @@ bot.on('text', async (ctx) => {
     if (!payment) return ctx.reply('⏳ Ei bKash TrxID-ti ekhono system-e asheni.');
     if (payment.is_used) return ctx.reply('❌ Ei bKash TrxID-ti already use kora hoyeche!');
 
-    const rate = parseFloat(process.env.USD_TO_BDT_RATE || 130);
+    const rate = cfg.usd_to_bdt_rate;
     const paidUsd = parseFloat((payment.amount / rate).toFixed(2));
 
     if (session.type === 'product') {
@@ -1042,9 +1016,431 @@ bot.on('text', async (ctx) => {
 });
 
 // ==========================================
-// 11. Safe Server & Webhook Setup
+// 11. BUILT-IN WEB ADMIN DASHBOARD (/admin)
 // ==========================================
-app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7!'));
+function verifyAdminReq(req, res, next) {
+  const pass = req.headers['x-admin-password'] || req.query.pass || req.body?.password;
+  if (pass !== ADMIN_PASS) return res.status(401).json({ error: 'Unauthorized! Wrong Admin Password.' });
+  next();
+}
+
+app.get('/api/admin/data', verifyAdminReq, async (req, res) => {
+  const settings = await getSupplierConfig();
+  const { data: products } = await supabase.from('products').select('*').order('id', { ascending: true });
+  const { data: users } = await supabase.from('users').select('*').order('balance', { ascending: false }).limit(50);
+  const { data: orders } = await supabase.from('orders').select('*').order('created_at', { ascending: false }).limit(20);
+  res.json({ settings, products: products || [], users: users || [], orders: orders || [] });
+});
+
+app.post('/api/admin/settings', verifyAdminReq, async (req, res) => {
+  const { store_name, supplier_base_url, supplier_api_key, profit_margin, usd_to_bdt_rate, bkash_number, binance_pay_id, support_username } = req.body;
+  const { error } = await supabase.from('settings').upsert([{
+    id: 1,
+    store_name,
+    supplier_base_url: supplier_base_url.replace(/\/$/, ''),
+    supplier_api_key,
+    profit_margin: parseFloat(profit_margin),
+    usd_to_bdt_rate: parseFloat(usd_to_bdt_rate),
+    bkash_number,
+    binance_pay_id,
+    support_username
+  }]);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.post('/api/admin/sync', verifyAdminReq, async (req, res) => {
+  try {
+    const result = await runSupplierSync();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/product/update', verifyAdminReq, async (req, res) => {
+  const { id, category, name, price, api_stock, description } = req.body;
+  const { error } = await supabase.from('products').update({
+    category, name, price: parseFloat(price), api_stock: parseInt(api_stock), description
+  }).eq('id', id);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.post('/api/admin/product/add', verifyAdminReq, async (req, res) => {
+  const { category, name, price, description, type, api_stock } = req.body;
+  const { error } = await supabase.from('products').insert([{
+    category, name, price: parseFloat(price), description, type: type || 'local', api_stock: parseInt(api_stock || 0)
+  }]);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.post('/api/admin/product/delete', verifyAdminReq, async (req, res) => {
+  const { id } = req.body;
+  await supabase.from('products').delete().eq('id', id);
+  res.json({ success: true });
+});
+
+app.post('/api/admin/user/balance', verifyAdminReq, async (req, res) => {
+  const { telegram_id, balance } = req.body;
+  const { error } = await supabase.from('users').update({ balance: parseFloat(balance) }).eq('telegram_id', telegram_id);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true });
+});
+
+app.post('/api/admin/broadcast', verifyAdminReq, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message empty' });
+  const { data: users } = await supabase.from('users').select('telegram_id');
+  let sent = 0;
+  for (const u of (users || [])) {
+    try {
+      await bot.telegram.sendMessage(u.telegram_id, message, { parse_mode: 'HTML' });
+      sent++;
+    } catch (e) {}
+  }
+  res.json({ success: true, sent });
+});
+
+app.get('/admin', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nexas Store — Admin Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+  <!-- Login Modal -->
+  <div id="loginScreen" class="fixed inset-0 bg-slate-950 flex items-center justify-center p-4 z-50">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+      <h1 class="text-xl font-bold text-center mb-2">🛡️ Nexas Admin Panel</h1>
+      <p class="text-xs text-slate-400 text-center mb-5">Enter your ADMIN_PASSWORD or WEBHOOK_SECRET</p>
+      <input id="passInput" type="password" placeholder="Admin Password" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 mb-4 text-sm focus:outline-none focus:border-indigo-500" />
+      <button onclick="login()" class="w-full bg-indigo-600 hover:bg-indigo-500 font-semibold py-2.5 rounded-xl text-sm transition">Login to Dashboard</button>
+    </div>
+  </div>
+
+  <!-- Main Dashboard -->
+  <div id="appScreen" class="hidden max-w-7xl mx-auto p-4 md:p-6">
+    <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4 mb-6">
+      <div>
+        <h1 class="text-2xl font-bold text-white">⚡ Nexas Bot Control Panel</h1>
+        <p class="text-xs text-slate-400">Customize your Telegram Bot in real-time</p>
+      </div>
+      <div class="flex gap-2">
+        <button onclick="syncNow()" id="syncBtn" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
+        <button onclick="loadData()" class="bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-xl text-xs font-semibold transition">↻ Refresh</button>
+        <button onclick="logout()" class="bg-rose-600/20 text-rose-400 hover:bg-rose-600/30 px-3 py-2 rounded-xl text-xs font-semibold">Logout</button>
+      </div>
+    </div>
+
+    <!-- Stats Row -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+        <p class="text-xs text-slate-400">Total Products</p>
+        <h2 id="statProducts" class="text-2xl font-bold mt-1">0</h2>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+        <p class="text-xs text-slate-400">Total Users</p>
+        <h2 id="statUsers" class="text-2xl font-bold mt-1">0</h2>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+        <p class="text-xs text-slate-400">Recent Orders</p>
+        <h2 id="statOrders" class="text-2xl font-bold mt-1">0</h2>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+        <p class="text-xs text-slate-400">Profit Margin</p>
+        <h2 id="statMargin" class="text-2xl font-bold mt-1 text-emerald-400">0%</h2>
+      </div>
+    </div>
+
+    <!-- Settings & Broadcast Grid -->
+    <div class="grid md:grid-cols-3 gap-6 mb-8">
+      <div class="md:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5">
+        <h3 class="font-bold text-base mb-4">⚙️ Store, Payment & Supplier Settings</h3>
+        <div class="grid sm:grid-cols-2 gap-3 text-xs">
+          <div>
+            <label class="text-slate-400 block mb-1">Store Name</label>
+            <input id="s_store_name" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Support Username</label>
+            <input id="s_support" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">bKash Personal Number</label>
+            <input id="s_bkash" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Binance Pay ID</label>
+            <input id="s_binance" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">USD to BDT Rate (1$ = ? BDT)</label>
+            <input id="s_rate" type="number" step="0.5" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Supplier Profit Margin (%)</label>
+            <input id="s_margin" type="number" step="1" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Supplier Base URL</label>
+            <input id="s_url" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Supplier API Key</label>
+            <input id="s_key" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+        </div>
+        <button onclick="saveSettings()" class="mt-4 bg-indigo-600 hover:bg-indigo-500 px-5 py-2.5 rounded-xl text-xs font-semibold">💾 Save All Settings</button>
+      </div>
+
+      <!-- Broadcast & Add Product -->
+      <div class="space-y-6">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+          <h3 class="font-bold text-base mb-2">📢 Broadcast to All Users</h3>
+          <textarea id="bcText" rows="3" placeholder="Write announcement or offer (HTML supported)..." class="w-full bg-slate-800 border border-slate-700 rounded-xl p-3 text-xs mb-3"></textarea>
+          <button onclick="sendBroadcast()" class="w-full bg-amber-600 hover:bg-amber-500 py-2 rounded-xl text-xs font-semibold">🚀 Send Broadcast</button>
+        </div>
+
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+          <h3 class="font-bold text-base mb-3">➕ Add Custom Product</h3>
+          <div class="space-y-2 text-xs">
+            <input id="n_cat" placeholder="Category (e.g. Gemini Pro)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            <input id="n_name" placeholder="Plan Name (e.g. 1 Year Link)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            <div class="grid grid-cols-2 gap-2">
+              <input id="n_price" type="number" step="0.01" placeholder="Price ($)" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+              <input id="n_stock" type="number" placeholder="Stock" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+            <button onclick="addProduct()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-xl font-semibold">Add Product</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Products Manager Table -->
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 mb-8">
+      <h3 class="font-bold text-base mb-4">🛍️ Products Manager (Edit Price, Name or Stock directly)</h3>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs">
+          <thead class="text-slate-400 border-b border-slate-800">
+            <tr>
+              <th class="pb-2">ID</th>
+              <th class="pb-2">Category</th>
+              <th class="pb-2">Plan Name</th>
+              <th class="pb-2">Price ($ USDT)</th>
+              <th class="pb-2">Stock</th>
+              <th class="pb-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="productsTable" class="divide-y divide-slate-800"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Users & Recent Orders -->
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+        <h3 class="font-bold text-base mb-4">👥 Users & Wallet Balance</h3>
+        <div class="overflow-x-auto max-h-80">
+          <table class="w-full text-left text-xs">
+            <thead class="text-slate-400 border-b border-slate-800">
+              <tr>
+                <th class="pb-2">Name</th>
+                <th class="pb-2">Telegram ID</th>
+                <th class="pb-2">Balance ($)</th>
+                <th class="pb-2">Action</th>
+              </tr>
+            </thead>
+            <tbody id="usersTable" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+        <h3 class="font-bold text-base mb-4">🧾 Recent Orders</h3>
+        <div class="overflow-x-auto max-h-80">
+          <table class="w-full text-left text-xs">
+            <thead class="text-slate-400 border-b border-slate-800">
+              <tr>
+                <th class="pb-2">Order ID</th>
+                <th class="pb-2">Product</th>
+                <th class="pb-2">Price</th>
+              </tr>
+            </thead>
+            <tbody id="ordersTable" class="divide-y divide-slate-800"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let ADMIN_KEY = localStorage.getItem('nexas_admin_key') || '';
+    if (ADMIN_KEY) loadData();
+
+    async function api(path, method = 'GET', body = null) {
+      const opts = { method, headers: { 'Content-Type': 'application/json', 'x-admin-password': ADMIN_KEY } };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(path, opts);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Request failed');
+      return data;
+    }
+
+    async function login() {
+      ADMIN_KEY = document.getElementById('passInput').value.trim();
+      try {
+        await loadData();
+        localStorage.setItem('nexas_admin_key', ADMIN_KEY);
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    function logout() {
+      localStorage.removeItem('nexas_admin_key');
+      location.reload();
+    }
+
+    async function loadData() {
+      const data = await api('/api/admin/data');
+      document.getElementById('loginScreen').classList.add('hidden');
+      document.getElementById('appScreen').classList.remove('hidden');
+
+      const s = data.settings;
+      document.getElementById('s_store_name').value = s.store_name || '';
+      document.getElementById('s_support').value = s.support_username || '';
+      document.getElementById('s_bkash').value = s.bkash_number || '';
+      document.getElementById('s_binance').value = s.binance_pay_id || '';
+      document.getElementById('s_rate').value = s.usd_to_bdt_rate || 130;
+      document.getElementById('s_margin').value = s.profit_margin ?? 20;
+      document.getElementById('s_url').value = s.supplier_base_url || '';
+      document.getElementById('s_key').value = s.supplier_api_key || '';
+
+      document.getElementById('statProducts').innerText = data.products.length;
+      document.getElementById('statUsers').innerText = data.users.length;
+      document.getElementById('statOrders').innerText = data.orders.length;
+      document.getElementById('statMargin').innerText = (s.profit_margin ?? 20) + '%';
+
+      const pBody = document.getElementById('productsTable');
+      pBody.innerHTML = data.products.map(p => \`
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-2 pr-2 font-mono">\${p.id}</td>
+          <td class="py-2 pr-2"><input id="p_cat_\${p.id}" value="\${(p.category||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-40" /></td>
+          <td class="py-2 pr-2"><input id="p_name_\${p.id}" value="\${(p.name||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-44" /></td>
+          <td class="py-2 pr-2"><input id="p_price_\${p.id}" type="number" step="0.01" value="\${p.price}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
+          <td class="py-2 pr-2"><input id="p_stock_\${p.id}" type="number" value="\${p.api_stock ?? 0}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
+          <td class="py-2 space-x-1">
+            <button onclick="saveProd(\${p.id})" class="bg-indigo-600 hover:bg-indigo-500 px-2.5 py-1 rounded font-semibold">Save</button>
+            <button onclick="delProd(\${p.id})" class="bg-rose-600/30 text-rose-300 hover:bg-rose-600 px-2 py-1 rounded">Del</button>
+          </td>
+        </tr>
+      \`).join('');
+
+      const uBody = document.getElementById('usersTable');
+      uBody.innerHTML = data.users.map(u => \`
+        <tr>
+          <td class="py-2">\${u.name || 'User'}</td>
+          <td class="py-2 font-mono">\${u.telegram_id}</td>
+          <td class="py-2"><input id="u_bal_\${u.telegram_id}" type="number" step="0.01" value="\${u.balance}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
+          <td class="py-2"><button onclick="saveBal('\${u.telegram_id}')" class="bg-emerald-600 px-2.5 py-1 rounded font-semibold">Update</button></td>
+        </tr>
+      \`).join('');
+
+      const oBody = document.getElementById('ordersTable');
+      oBody.innerHTML = data.orders.map(o => \`
+        <tr>
+          <td class="py-2 font-mono">\${o.id}</td>
+          <td class="py-2">\${o.product_name}</td>
+          <td class="py-2 text-emerald-400 font-semibold">$\${Number(o.price).toFixed(2)}</td>
+        </tr>
+      \`).join('');
+    }
+
+    async function saveSettings() {
+      await api('/api/admin/settings', 'POST', {
+        store_name: document.getElementById('s_store_name').value,
+        support_username: document.getElementById('s_support').value,
+        bkash_number: document.getElementById('s_bkash').value,
+        binance_pay_id: document.getElementById('s_binance').value,
+        usd_to_bdt_rate: document.getElementById('s_rate').value,
+        profit_margin: document.getElementById('s_margin').value,
+        supplier_base_url: document.getElementById('s_url').value,
+        supplier_api_key: document.getElementById('s_key').value
+      });
+      alert('✅ Settings Saved Successfully!');
+      loadData();
+    }
+
+    async function syncNow() {
+      const btn = document.getElementById('syncBtn');
+      btn.innerText = '⏳ Syncing...';
+      try {
+        const res = await api('/api/admin/sync', 'POST');
+        alert(\`✅ Sync Done! Added: \${res.added}, Updated: \${res.updated}\`);
+        loadData();
+      } catch (e) {
+        alert('❌ Sync Error: ' + e.message);
+      }
+      btn.innerText = '🔄 1-Click Supplier Sync';
+    }
+
+    async function saveProd(id) {
+      await api('/api/admin/product/update', 'POST', {
+        id,
+        category: document.getElementById('p_cat_' + id).value,
+        name: document.getElementById('p_name_' + id).value,
+        price: document.getElementById('p_price_' + id).value,
+        api_stock: document.getElementById('p_stock_' + id).value
+      });
+      alert('✅ Product Updated!');
+    }
+
+    async function delProd(id) {
+      if (!confirm('Delete this product?')) return;
+      await api('/api/admin/product/delete', 'POST', { id });
+      loadData();
+    }
+
+    async function addProduct() {
+      await api('/api/admin/product/add', 'POST', {
+        category: document.getElementById('n_cat').value,
+        name: document.getElementById('n_name').value,
+        price: document.getElementById('n_price').value,
+        api_stock: document.getElementById('n_stock').value,
+        type: 'api',
+        description: '• Instant Automated Delivery'
+      });
+      alert('✅ Product Added!');
+      loadData();
+    }
+
+    async function saveBal(tgId) {
+      const bal = document.getElementById('u_bal_' + tgId).value;
+      await api('/api/admin/user/balance', 'POST', { telegram_id: tgId, balance: bal });
+      alert('✅ User Balance Updated!');
+    }
+
+    async function sendBroadcast() {
+      const message = document.getElementById('bcText').value.trim();
+      if (!message) return alert('Write a message first!');
+      const res = await api('/api/admin/broadcast', 'POST', { message });
+      alert(\`🚀 Broadcast sent to \${res.sent} users!\`);
+      document.getElementById('bcText').value = '';
+    }
+  </script>
+</body>
+</html>`);
+});
+
+// ==========================================
+// 12. Safe Server & Webhook Setup
+// ==========================================
+app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7! Visit /admin for Control Panel.'));
 app.use(bot.webhookCallback('/telegram-webhook'));
 bot.catch((err) => console.error('Bot Error:', err));
 
