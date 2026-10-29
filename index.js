@@ -2,7 +2,7 @@ const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
 
 require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf } = require('telegraf');
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
@@ -27,12 +27,40 @@ bot.telegram.setMyCommands([
 ]).catch(console.error);
 
 // ==========================================
+// NATIVE TELEGRAM COLORED BUTTON BUILDER
+// styles: 'success' (Green), 'danger' (Red), 'primary' (Blue), null (Default Dark)
+// ==========================================
+function cBtn(text, callback_data, style = null, customEmojiId = null) {
+  const btn = { text, callback_data };
+  if (style) btn.style = style;
+  if (customEmojiId && String(customEmojiId).trim() !== '') {
+    btn.icon_custom_emoji_id = String(customEmojiId).trim();
+  }
+  return btn;
+}
+
+function uBtn(text, url, style = null, customEmojiId = null) {
+  const btn = { text, url };
+  if (style) btn.style = style;
+  if (customEmojiId && String(customEmojiId).trim() !== '') {
+    btn.icon_custom_emoji_id = String(customEmojiId).trim();
+  }
+  return btn;
+}
+
+function kbMarkup(inline_keyboard) {
+  return { reply_markup: { inline_keyboard } };
+}
+
+// ==========================================
 // SMART EMOJI & THEME HELPERS
 // ==========================================
 function getProductEmoji(productOrName = '', customEmoji = '') {
   if (customEmoji && customEmoji.trim() !== '') return customEmoji.trim() + ' ';
   const name = typeof productOrName === 'object' ? (productOrName.category || productOrName.name || '') : productOrName;
-  if (typeof productOrName === 'object' && productOrName.emoji) return productOrName.emoji.trim() + ' ';
+  if (typeof productOrName === 'object' && productOrName.emoji && productOrName.emoji.trim() !== '') {
+    return productOrName.emoji.trim() + ' ';
+  }
 
   const n = name.toLowerCase();
   if (/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/u.test(name.slice(0, 4))) return '';
@@ -42,7 +70,7 @@ function getProductEmoji(productOrName = '', customEmoji = '') {
   if (n.includes('capcut') || n.includes('alight')) return '🎬 ';
   if (n.includes('canva') || n.includes('figma') || n.includes('adobe') || n.includes('autodesk')) return '🎨 ';
   if (n.includes('vpn') || n.includes('nord') || n.includes('hma') || n.includes('surfshark') || n.includes('v2ray') || n.includes('proxy')) return '🛡️ ';
-  if (n.includes('gmail') || n.includes('mail') || n.includes('outlook')) return '📧 ';
+  if (n.includes('gmail') || n.includes('mail') || n.includes('outlook') || n.includes('microsoft')) return '📧 ';
   if (n.includes('claude') || n.includes('gpt') || n.includes('openai') || n.includes('codex') || n.includes('muse') || n.includes('replit') || n.includes('lovable') || n.includes('notion')) return '🤖 ';
   if (n.includes('telegram')) return '✈️ ';
   if (n.includes('netflix') || n.includes('prime') || n.includes('apple tv') || n.includes('shahid')) return '🍿 ';
@@ -51,20 +79,8 @@ function getProductEmoji(productOrName = '', customEmoji = '') {
   return '💥 ';
 }
 
-function getThemeBadge(themeColor = 'emerald') {
-  const map = { emerald: '🟢', blue: '🔵', purple: '🟣', amber: '🟡', rose: '🔴' };
-  return map[themeColor] || '🟢';
-}
-
-function getStockStatusIcon(stock, themeColor = 'emerald') {
-  if (stock <= 0) return '🔴';
-  if (stock <= 5) return '🟡';
-  return getThemeBadge(themeColor);
-}
-
-// Chobi thakle ebong na thakle smoothly message update korar helper
-async function renderScreen(ctx, text, keyboard, imageUrl = null, isEdit = true) {
-  const extra = { parse_mode: 'HTML', ...keyboard };
+async function renderScreen(ctx, text, keyboardObj, imageUrl = null, isEdit = true) {
+  const extra = { parse_mode: 'HTML', ...keyboardObj };
   try {
     if (imageUrl && imageUrl.startsWith('http')) {
       if (isEdit && ctx.callbackQuery?.message) {
@@ -82,7 +98,17 @@ async function renderScreen(ctx, text, keyboard, imageUrl = null, isEdit = true)
       return await ctx.reply(text, extra);
     }
   } catch (err) {
-    return await ctx.reply(text, extra).catch(() => {});
+    // Fallback if Telegram client/API rejects custom button style or emoji id
+    try {
+      const strippedKb = keyboardObj?.reply_markup?.inline_keyboard?.map(row =>
+        row.map(({ style, icon_custom_emoji_id, ...rest }) => rest)
+      );
+      const fallbackExtra = { parse_mode: 'HTML', ...(strippedKb ? kbMarkup(strippedKb) : {}) };
+      if (isEdit && ctx.callbackQuery?.message && !ctx.callbackQuery.message.photo) {
+        return await ctx.editMessageText(text, fallbackExtra);
+      }
+      return await ctx.reply(text, fallbackExtra);
+    } catch (e2) {}
   }
 }
 
@@ -132,7 +158,7 @@ async function getProductStock(product) {
 }
 
 // ==========================================
-// SUPPLIER SYNC ENGINE (PRESERVES CUSTOM IMAGE & EMOJI)
+// SUPPLIER SYNC ENGINE
 // ==========================================
 async function runSupplierSync() {
   const sup = await getSupplierConfig();
@@ -191,7 +217,6 @@ async function runSupplierSync() {
       .maybeSingle();
 
     if (existing) {
-      // Update stock & price, kintu admin jodi custom image/emoji diye thake seta muche jabe na
       await supabase.from('products').update({
         price: sellPrice,
         api_stock: stock,
@@ -358,7 +383,6 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     }
   }
 
-  // Update Stock & Sold Count
   const newSold = Number(product.sold_count || 0) + Number(qty);
   const newApiStock = product.type === 'api' && product.api_stock >= qty ? product.api_stock - qty : product.api_stock;
   await supabase.from('products').update({ sold_count: newSold, api_stock: newApiStock }).eq('id', product.id);
@@ -387,10 +411,10 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     `📌 <b>Important Instructions:</b>\n` +
     `<blockquote>${product.description || '• Activate on your own account'}</blockquote>`;
 
-  const keyboard = Markup.inlineKeyboard([
+  const keyboard = kbMarkup([
     [
-      Markup.button.callback('🛍️ Shop Again', 'menu_shop'),
-      Markup.button.callback('👤 My Profile', 'menu_profile')
+      cBtn('🛍️ Shop Again', 'menu_shop', 'success'),
+      cBtn('👤 My Profile', 'menu_profile', 'primary')
     ]
   ]);
 
@@ -398,27 +422,26 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
 }
 
 // ==========================================
-// 1. Main Menu UI (Supports Deep Link Product Share)
+// 1. Main Menu UI
 // ==========================================
 async function sendMainMenu(ctx, isEdit = false) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
   const cfg = await getSupplierConfig();
-  const badge = getThemeBadge(cfg.theme_color);
 
   const text =
-    `Welcome to <b>${cfg.store_name}</b> ${badge}\n` +
+    `Welcome to <b>${cfg.store_name}</b> ⚡\n` +
     `👋🏻 Hello! <b>${user.name}</b>\n\n` +
     `📌 <b>Account Details</b>\n` +
     `💳 Telegram ID: <code>${user.telegram_id}</code>\n` +
     `💰 Balance: <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\n` +
     `Choose below ⬇️`;
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🛒 Cloud Store Catalog', 'menu_shop'), Markup.button.callback('💰 Wallet', 'menu_wallet')],
-    [Markup.button.callback('🧾 Order History', 'menu_orders'), Markup.button.callback('🔄 Recover Order', 'menu_recover')],
-    [Markup.button.callback('💰 Refer & Earn', 'menu_refer'), Markup.button.callback('🛡️ Profile', 'menu_profile')],
-    [Markup.button.callback('🛟 Support', 'menu_support'), Markup.button.callback('🔑 API Access', 'menu_apikey')]
+  const keyboard = kbMarkup([
+    [cBtn('🛒 Cloud Store Catalog', 'menu_shop', 'success'), cBtn('💰 Wallet', 'menu_wallet', 'primary')],
+    [cBtn('🧾 Order History', 'menu_orders'), cBtn('🔄 Recover Order', 'menu_recover')],
+    [cBtn('💰 Refer & Earn', 'menu_refer'), cBtn('🛡️ Profile', 'menu_profile')],
+    [cBtn('🛟 Support', 'menu_support'), cBtn('🔑 API Access', 'menu_apikey')]
   ]);
 
   return renderScreen(ctx, text, keyboard, cfg.default_banner, isEdit);
@@ -427,7 +450,6 @@ async function sendMainMenu(ctx, isEdit = false) {
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
   await getUser(ctx, payload);
-  // Jodi keu Share Product link theke ashe (e.g. ?start=prod_12)
   if (payload && payload.startsWith('prod_')) {
     const prodId = Number(payload.replace('prod_', ''));
     if (prodId) return showProductView(ctx, prodId, 1, false);
@@ -439,7 +461,7 @@ bot.command('menu', (ctx) => sendMainMenu(ctx, false));
 bot.action('main_menu', (ctx) => { ctx.answerCbQuery(); sendMainMenu(ctx, true); });
 
 // ==========================================
-// 2. Cloud Store Catalog
+// 2. Cloud Store Catalog (GREEN if In-Stock, RED if Out-of-Stock!)
 // ==========================================
 async function showCatalog(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
@@ -448,7 +470,7 @@ async function showCatalog(ctx, isEdit = true) {
 
   if (!products || products.length === 0) {
     const emptyMsg = '🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Currently kono product stock-e nei.\n\n<i>Admin hole /sync command ba Web Dashboard theke import korun!</i>';
-    const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]]);
+    const kb = kbMarkup([[cBtn('⬅️ Back to Main Menu', 'main_menu', 'primary')]]);
     return renderScreen(ctx, emptyMsg, kb, null, isEdit);
   }
 
@@ -463,37 +485,45 @@ async function showCatalog(ctx, isEdit = true) {
   }
 
   const catList = Object.values(categories);
+  // In-stock (Green) upore thakbe, Out-of-stock (Red) niche thakbe
   catList.sort((a, b) => (b.totalStock > 0 ? 1 : 0) - (a.totalStock > 0 ? 1 : 0));
 
   const buttons = [];
   for (let i = 0; i < catList.length; i += 2) {
     const row = [];
     const c1 = catList[i];
-    const emoji1 = getProductEmoji(c1.firstProd);
-    const status1 = getStockStatusIcon(c1.totalStock, cfg.theme_color);
-    row.push(Markup.button.callback(`${emoji1}${c1.name} (${c1.totalStock}) ${status1}`, `cat_${c1.firstProd.id}`));
+    const hasCustomIcon1 = c1.firstProd.custom_emoji_id && String(c1.firstProd.custom_emoji_id).trim() !== '';
+    const emoji1 = hasCustomIcon1 ? '' : getProductEmoji(c1.firstProd);
+    const style1 = c1.totalStock > 0 ? 'success' : 'danger'; // GREEN if stock > 0, RED if 0!
+    row.push(cBtn(`${emoji1}${c1.name} (${c1.totalStock})`, `cat_${c1.firstProd.id}`, style1, c1.firstProd.custom_emoji_id));
 
     if (catList[i + 1]) {
       const c2 = catList[i + 1];
-      const emoji2 = getProductEmoji(c2.firstProd);
-      const status2 = getStockStatusIcon(c2.totalStock, cfg.theme_color);
-      row.push(Markup.button.callback(`${emoji2}${c2.name} (${c2.totalStock}) ${status2}`, `cat_${c2.firstProd.id}`));
+      const hasCustomIcon2 = c2.firstProd.custom_emoji_id && String(c2.firstProd.custom_emoji_id).trim() !== '';
+      const emoji2 = hasCustomIcon2 ? '' : getProductEmoji(c2.firstProd);
+      const style2 = c2.totalStock > 0 ? 'success' : 'danger';
+      row.push(cBtn(`${emoji2}${c2.name} (${c2.totalStock})`, `cat_${c2.firstProd.id}`, style2, c2.firstProd.custom_emoji_id));
     }
     buttons.push(row);
   }
 
-  buttons.push([Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]);
+  buttons.push([cBtn('⬅️ Back to Main Menu', 'main_menu', 'primary')]);
 
-  const text = `🌈 <b>${cfg.store_name.toUpperCase()} — CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n🚀 Instant Delivery 24/7\n📦 Total Categories: <b>${catList.length}</b>\n\n👇 Choose a product below :`;
+  const text =
+    `🌈 <b>CLOUD STORE CATALOG</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `⚡ Instant Delivery 24/7\n` +
+    `📦 Total Products: <b>${catList.length}</b>\n\n` +
+    `👇 Choose a product below :`;
 
-  return renderScreen(ctx, text, Markup.inlineKeyboard(buttons), cfg.default_banner, isEdit);
+  return renderScreen(ctx, text, kbMarkup(buttons), cfg.default_banner, isEdit);
 }
 
 bot.action('menu_shop', (ctx) => { ctx.answerCbQuery(); showCatalog(ctx, true); });
 bot.command('products', (ctx) => showCatalog(ctx, false));
 
 // ==========================================
-// 3. Category View & Variants
+// 3. Category View & Variants (GREEN / RED Buttons)
 // ==========================================
 bot.action(/cat_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
@@ -505,7 +535,6 @@ bot.action(/cat_(\d+)/, async (ctx) => {
   const catName = firstProd.category || firstProd.name;
   const { data: variants } = await supabase.from('products').select('*').eq('category', catName).order('id', { ascending: true });
 
-  // Jodi ei category-te matro 1ti plan thake, tahole soraSori Screenshot-er moto Product Card open hobe!
   if (variants && variants.length === 1) {
     return showProductView(ctx, variants[0].id, 1, true, true);
   }
@@ -516,13 +545,14 @@ bot.action(/cat_(\d+)/, async (ctx) => {
 
   for (const v of (variants || [firstProd])) {
     const stock = await getProductStock(v);
-    const btnIcon = getStockStatusIcon(stock, cfg.theme_color);
-    const vEmoji = v.emoji ? `${v.emoji} ` : '';
+    const btnStyle = stock > 0 ? 'success' : 'danger';
+    const hasCustomIcon = v.custom_emoji_id && String(v.custom_emoji_id).trim() !== '';
+    const vEmoji = hasCustomIcon ? '' : getProductEmoji(v);
     buttons.push([
-      Markup.button.callback(`${btnIcon} ${vEmoji}${v.name} — $${Number(v.price).toFixed(2)} [Stock: ${stock}]`, `sel_${v.id}_1`)
+      cBtn(`${vEmoji}${v.name} — $${Number(v.price).toFixed(2)} (${stock})`, `sel_${v.id}_1`, btnStyle, v.custom_emoji_id)
     ]);
   }
-  buttons.push([Markup.button.callback('🔙 Back to Catalog', 'menu_shop')]);
+  buttons.push([cBtn('⬅️ Back to Catalog', 'menu_shop', 'primary')]);
 
   const text =
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -533,11 +563,11 @@ bot.action(/cat_(\d+)/, async (ctx) => {
     `👇 <b>Select a plan below:</b>`;
 
   const banner = firstProd.image_url || cfg.default_banner;
-  return renderScreen(ctx, text, Markup.inlineKeyboard(buttons), banner, true);
+  return renderScreen(ctx, text, kbMarkup(buttons), banner, true);
 });
 
 // ==========================================
-// 4. Excalibur-Style Product Card (Image + Sold + Quote + Share)
+// 4. Excalibur-Style Product Card (Colored Buttons!)
 // ==========================================
 async function showProductView(ctx, prodId, qty = 1, isEdit = true, fromCatalog = false) {
   pendingCheckouts.delete(ctx.from.id);
@@ -562,40 +592,48 @@ async function showProductView(ctx, prodId, qty = 1, isEdit = true, fromCatalog 
   const shareText = encodeURIComponent(`🔥 Check out ${product.name} ($${unitPrice}) on ${cfg.store_name}!`);
   const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(shareLink)}&text=${shareText}`;
 
-  // Exact Excalibur TechBot Layout from your Screenshot!
+  const stockBadge = stock > 0 ? '✅ Instant delivery' : '❌ Out of Stock';
+
   const text =
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `${emoji}<b>${product.name}</b> ✅\n` +
+    `${emoji}<b>${product.name}</b> ${stock > 0 ? '✅' : '🔴'}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💵 Price: $${unitPrice}  🛒 Qty: ${qty}  💳 Total: $${totalPrice}\n` +
     `📦 Stock: ${stock}  📊 Sold: ${soldCount} accounts\n\n` +
-    `✅ Instant delivery\n` +
+    `${stockBadge}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `🏷️ <b>Product Description</b>\n` +
     `<blockquote>${product.description || 'Automatically fulfilled through Nexas Cloud Store.'}</blockquote>`;
 
   const backAction = fromCatalog ? 'menu_shop' : `cat_${prodId}`;
 
-  const keyboard = Markup.inlineKeyboard([
+  // Buy button GREEN if stock > 0, RED if stock == 0!
+  const buyButton = stock > 0
+    ? cBtn(`✅ Buy (Total: $${totalPrice})`, `paymenu_${prodId}_${qty}`, 'success')
+    : cBtn(`❌ Out of Stock ($${totalPrice})`, `noop_out`, 'danger');
+
+  const keyboard = kbMarkup([
     [
-      Markup.button.callback('➖', `sel_${prodId}_${minusQty}`),
-      Markup.button.callback(`✏️ Qty: ${qty}`, `noop`),
-      Markup.button.callback('➕', `sel_${prodId}_${plusQty}`)
+      cBtn('-', `sel_${prodId}_${minusQty}`, 'primary'),
+      cBtn(`✏️ Qty: ${qty}`, `noop`, 'danger'),
+      cBtn('+', `sel_${prodId}_${plusQty}`, 'primary')
     ],
     [
-      Markup.button.callback('5', `sel_${prodId}_5`),
-      Markup.button.callback('10', `sel_${prodId}_10`),
-      Markup.button.callback('50', `sel_${prodId}_50`),
-      Markup.button.callback('100', `sel_${prodId}_100`)
+      cBtn('5', `sel_${prodId}_5`),
+      cBtn('10', `sel_${prodId}_10`),
+      cBtn('50', `sel_${prodId}_50`),
+      cBtn('100', `sel_${prodId}_100`)
     ],
-    [Markup.button.callback(`✅ Buy (Total: $${totalPrice})`, `paymenu_${prodId}_${qty}`)],
-    [Markup.button.url('📤 Share Product', shareUrl)],
-    [Markup.button.callback('Back', backAction)]
+    [buyButton],
+    [uBtn('📤 Share Product', shareUrl)],
+    [cBtn('Back', backAction, 'danger')]
   ]);
 
   const banner = product.image_url || cfg.default_banner;
   return renderScreen(ctx, text, keyboard, banner, isEdit);
 }
+
+bot.action('noop_out', (ctx) => ctx.answerCbQuery('❌ Sorry, this product is currently out of stock!', { show_alert: true }));
 
 bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
@@ -604,17 +642,21 @@ bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
   return showProductView(ctx, prodId, qty, true);
 });
 
-// Buy Button click korle Payment Method Selector open hobe
 bot.action(/paymenu_(\d+)_(\d+)/, async (ctx) => {
-  ctx.answerCbQuery();
   const prodId = Number(ctx.match[1]);
   const qty = Number(ctx.match[2]);
 
   const user = await getUser(ctx);
   const cfg = await getSupplierConfig();
   const { data: product } = await supabase.from('products').select('*').eq('id', prodId).single();
-  if (!product) return;
+  if (!product) return ctx.answerCbQuery('Product not found!');
 
+  const stock = await getProductStock(product);
+  if (stock < qty) {
+    return ctx.answerCbQuery(`❌ Out of stock! Available: ${stock}`, { show_alert: true });
+  }
+
+  ctx.answerCbQuery();
   const totalPrice = (Number(product.price) * qty).toFixed(2);
   const totalBdt = Math.ceil(Number(totalPrice) * cfg.usd_to_bdt_rate);
   const emoji = getProductEmoji(product);
@@ -629,11 +671,11 @@ bot.action(/paymenu_(\d+)_(\d+)/, async (ctx) => {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `👇 Choose how you want to pay:`;
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback(`👛 Pay with Wallet Balance ($${totalPrice})`, `buy_${prodId}_${qty}`)],
-    [Markup.button.callback(`🟡 Pay with Binance Pay ($${totalPrice})`, `chk_bn_${prodId}_${qty}`)],
-    [Markup.button.callback(`📱 Pay with Personal bKash (${totalBdt} BDT)`, `chk_bk_${prodId}_${qty}`)],
-    [Markup.button.callback('⬅️ Back to Product', `sel_${prodId}_${qty}`)]
+  const keyboard = kbMarkup([
+    [cBtn(`👛 Pay with Wallet Balance ($${totalPrice})`, `buy_${prodId}_${qty}`, 'success')],
+    [cBtn(`🟡 Pay with Binance Pay ($${totalPrice})`, `chk_bn_${prodId}_${qty}`, 'primary')],
+    [cBtn(`📱 Pay with Personal bKash (${totalBdt} BDT)`, `chk_bk_${prodId}_${qty}`, 'primary')],
+    [cBtn('⬅️ Back to Product', `sel_${prodId}_${qty}`, 'danger')]
   ]);
 
   return renderScreen(ctx, text, keyboard, product.image_url || cfg.default_banner, true);
@@ -692,9 +734,9 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🕒 <b>Waiting for your Transfer Order ID •••</b> <i>( Expires in 5 minutes )</i>`;
 
-    return renderScreen(ctx, text, Markup.inlineKeyboard([
-      [Markup.button.callback('❓ Where is my Order ID?', 'help_orderid')],
-      [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
+    return renderScreen(ctx, text, kbMarkup([
+      [cBtn('❓ Where is my Order ID?', 'help_orderid', 'primary')],
+      [cBtn('❌ Cancel Order', `sel_${prodId}_${qty}`, 'danger')]
     ]), null, true);
   } else {
     const text =
@@ -714,8 +756,8 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🕒 <b>Waiting for your bKash TrxID •••</b> <i>( Expires in 5 minutes )</i>`;
 
-    return renderScreen(ctx, text, Markup.inlineKeyboard([
-      [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
+    return renderScreen(ctx, text, kbMarkup([
+      [cBtn('❌ Cancel Order', `sel_${prodId}_${qty}`, 'danger')]
     ]), null, true);
   }
 });
@@ -766,9 +808,9 @@ async function showWallet(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
   const text = `💰 <b>YOUR WALLET</b>\n━━━━━━━━━━━━━━━━━━━━\n💳 <b>Telegram ID:</b> <code>${user.telegram_id}</code>\n💵 <b>Current Balance:</b> <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\n👇 Choose deposit method:`;
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.callback('🟡 Binance Pay (Auto)', 'dep_binance'), Markup.button.callback('📱 Personal bKash (Auto)', 'dep_bkash')],
-    [Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]
+  const kb = kbMarkup([
+    [cBtn('🟡 Binance Pay (Auto)', 'dep_binance', 'success'), cBtn('📱 Personal bKash (Auto)', 'dep_bkash', 'primary')],
+    [cBtn('⬅️ Back to Main Menu', 'main_menu', 'danger')]
   ]);
   return renderScreen(ctx, text, kb, null, isEdit);
 }
@@ -783,7 +825,7 @@ bot.action('dep_binance', async (ctx) => {
   return renderScreen(
     ctx,
     `🟡 <b>WALLET DEPOSIT - BINANCE PAY</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Open Binance App ➔ <b>Pay ➔ Send</b>\n2️⃣ Send USDT to Binance ID: <code>${cfg.binance_pay_id}</code>\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>Transfer Order ID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your Order ID •••</b>`,
-    Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]),
+    kbMarkup([[cBtn('❌ Cancel', 'menu_wallet', 'danger')]]),
     null,
     true
   );
@@ -796,7 +838,7 @@ bot.action('dep_bkash', async (ctx) => {
   return renderScreen(
     ctx,
     `📱 <b>WALLET DEPOSIT - PERSONAL BKASH</b>\n━━━━━━━━━━━━━━━━━━━━\n📞 <b>bKash Number:</b> <code>${cfg.bkash_number}</code>\n💱 <b>Rate:</b> $1 = ${cfg.usd_to_bdt_rate} BDT\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>bKash TrxID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your TrxID •••</b>`,
-    Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]),
+    kbMarkup([[cBtn('❌ Cancel', 'menu_wallet', 'danger')]]),
     null,
     true
   );
@@ -826,23 +868,23 @@ bot.command('api', async (ctx) => {
 bot.action('menu_apikey', async (ctx) => {
   ctx.answerCbQuery();
   const user = await getUser(ctx);
-  return renderScreen(ctx, `🔑 <b>Reseller API Key</b>\n\n<code>${user.api_key}</code>`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  return renderScreen(ctx, `🔑 <b>Reseller API Key</b>\n\n<code>${user.api_key}</code>`, kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
 });
 
 bot.action('menu_orders', async (ctx) => {
   ctx.answerCbQuery();
   const { data: orders } = await supabase.from('orders').select('*').eq('telegram_id', ctx.from.id).order('created_at', { ascending: false }).limit(5);
-  if (!orders || orders.length === 0) return renderScreen(ctx, '🧾 Kono order pawa jayni.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  if (!orders || orders.length === 0) return renderScreen(ctx, '🧾 Kono order pawa jayni.', kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
   let text = '🧾 <b>Recent Orders:</b>\n\n';
   orders.forEach(o => { text += `🔹 <code>${o.id}</code> | ${o.product_name} ($${o.price})\n🔑 <code>${o.delivered_data}</code>\n\n`; });
-  return renderScreen(ctx, text, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  return renderScreen(ctx, text, kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
 });
 
 bot.action('menu_refer', async (ctx) => {
   ctx.answerCbQuery();
   const user = await getUser(ctx);
   const { count } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('referred_by', user.telegram_id);
-  return renderScreen(ctx, `💰 <b>Refer & Earn</b>\n\n👥 Total Referrals: ${count || 0}\n🔗 Link: <code>https://t.me/${(process.env.BOT_USERNAME||'').replace('@','')}?start=${user.telegram_id}</code>`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  return renderScreen(ctx, `💰 <b>Refer & Earn</b>\n\n👥 Total Referrals: ${count || 0}\n🔗 Link: <code>https://t.me/${(process.env.BOT_USERNAME||'').replace('@','')}?start=${user.telegram_id}</code>`, kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
 });
 
 bot.action('menu_profile', async (ctx) => {
@@ -851,9 +893,9 @@ bot.action('menu_profile', async (ctx) => {
   return renderScreen(
     ctx,
     `🛡️ <b>My Profile</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>Name:</b> ${user.name}\n🆔 <b>Telegram ID:</b> <code>${user.telegram_id}</code>\n💰 <b>Balance:</b> $${Number(user.balance).toFixed(2)} USDT`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('🛍️ Shop Catalog', 'menu_shop'), Markup.button.callback('💰 Deposit', 'menu_wallet')],
-      [Markup.button.callback('⬅️ Main Menu', 'main_menu')]
+    kbMarkup([
+      [cBtn('🛍️ Shop Catalog', 'menu_shop', 'success'), cBtn('💰 Deposit', 'menu_wallet', 'primary')],
+      [cBtn('⬅️ Main Menu', 'main_menu', 'danger')]
     ]),
     null,
     true
@@ -863,12 +905,12 @@ bot.action('menu_profile', async (ctx) => {
 bot.action('menu_support', async (ctx) => {
   ctx.answerCbQuery();
   const cfg = await getSupplierConfig();
-  return renderScreen(ctx, `🛟 Support: ${cfg.support_username}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  return renderScreen(ctx, `🛟 Support: ${cfg.support_username}`, kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
 });
 
 bot.action('menu_recover', (ctx) => {
   ctx.answerCbQuery();
-  return renderScreen(ctx, '🔄 Order recover korte din: <code>/recover ORD-XXXX</code>', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
+  return renderScreen(ctx, '🔄 Order recover korte din: <code>/recover ORD-XXXX</code>', kbMarkup([[cBtn('⬅️ Back', 'main_menu', 'primary')]]), null, true);
 });
 
 bot.command('recover', async (ctx) => {
@@ -902,7 +944,6 @@ bot.command('supplier', async (ctx) => {
   ctx.reply(
     `⚙️ <b>CURRENT SUPPLIER & STORE SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
     `🏪 <b>Store Name:</b> ${sup.store_name}\n` +
-    `🎨 <b>Theme Color:</b> ${sup.theme_color}\n` +
     `🌐 <b>Base URL:</b> <code>${sup.supplier_base_url}</code>\n` +
     `📈 <b>Profit Margin:</b> <code>${sup.profit_margin}%</code>\n` +
     `💱 <b>USD Rate:</b> <code>${sup.usd_to_bdt_rate} BDT</code>\n` +
@@ -1032,7 +1073,7 @@ bot.on('text', async (ctx) => {
           waitMsg.message_id,
           null,
           `🎉 <b>PAYMENT VERIFIED SUCCESSFULLY!</b> 🎉\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Added to Wallet:</b> <code>${paidAmount.toFixed(2)} USDT (Binance Pay)</code>`,
-          { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🛍️ Shop Now', 'menu_shop'), Markup.button.callback('👤 My Profile', 'menu_profile')]]) }
+          { parse_mode: 'HTML', ...kbMarkup([[cBtn('🛍️ Shop Now', 'menu_shop', 'success'), cBtn('👤 My Profile', 'menu_profile', 'primary')]]) }
         );
       }
     } catch (err) {
@@ -1080,7 +1121,7 @@ bot.on('text', async (ctx) => {
       await supabase.from('users').update({ balance: Number(user.balance) + paidUsd }).eq('telegram_id', user.telegram_id);
       return ctx.reply(
         `🎉 <b>PAYMENT VERIFIED SUCCESSFULLY!</b> 🎉\n━━━━━━━━━━━━━━━━━━━━\n💰 <b>Added to Wallet:</b> <code>$${paidUsd.toFixed(2)} USDT (${payment.amount} BDT bKash)</code>`,
-        { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🛍️ Shop Now', 'menu_shop'), Markup.button.callback('👤 My Profile', 'menu_profile')]]) }
+        { parse_mode: 'HTML', ...kbMarkup([[cBtn('🛍️ Shop Now', 'menu_shop', 'success'), cBtn('👤 My Profile', 'menu_profile', 'primary')]]) }
       );
     }
   }
@@ -1137,9 +1178,10 @@ app.post('/api/admin/sync', verifyAdminReq, async (req, res) => {
 });
 
 app.post('/api/admin/product/update', verifyAdminReq, async (req, res) => {
-  const { id, emoji, category, name, price, api_stock, sold_count, image_url, description } = req.body;
+  const { id, emoji, custom_emoji_id, category, name, price, api_stock, sold_count, image_url, description } = req.body;
   const { error } = await supabase.from('products').update({
     emoji: emoji || '',
+    custom_emoji_id: custom_emoji_id || '',
     category,
     name,
     price: parseFloat(price || 0),
@@ -1153,9 +1195,10 @@ app.post('/api/admin/product/update', verifyAdminReq, async (req, res) => {
 });
 
 app.post('/api/admin/product/add', verifyAdminReq, async (req, res) => {
-  const { emoji, category, name, price, description, type, api_stock, image_url } = req.body;
+  const { emoji, custom_emoji_id, category, name, price, description, type, api_stock, image_url } = req.body;
   const { error } = await supabase.from('products').insert([{
     emoji: emoji || '💥',
+    custom_emoji_id: custom_emoji_id || '',
     category,
     name,
     price: parseFloat(price || 1),
@@ -1218,9 +1261,9 @@ app.get('/admin', (req, res) => {
 
   <!-- Product Visual Editor Modal -->
   <div id="prodModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-3xl max-h-[90vh] overflow-y-auto">
       <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
-        <h3 class="font-bold text-lg">🎨 Customize Product Card & Preview</h3>
+        <h3 class="font-bold text-lg">🎨 Customize Product Card & Live Preview</h3>
         <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
       </div>
       <div class="grid md:grid-cols-2 gap-6">
@@ -1228,13 +1271,17 @@ app.get('/admin', (req, res) => {
           <input type="hidden" id="m_id" />
           <div class="grid grid-cols-3 gap-2">
             <div>
-              <label class="text-slate-400 block mb-1">Emoji Icon</label>
+              <label class="text-slate-400 block mb-1">Emoji</label>
               <input id="m_emoji" oninput="updatePreview()" placeholder="💥 or ✨" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-center text-base" />
             </div>
             <div class="col-span-2">
-              <label class="text-slate-400 block mb-1">Category</label>
+              <label class="text-slate-400 block mb-1">Category Name</label>
               <input id="m_cat" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
             </div>
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Telegram Custom Emoji ID (Optional App Logo ID)</label>
+            <input id="m_custom_emoji" placeholder="e.g. 5368324170671202286" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 font-mono" />
           </div>
           <div>
             <label class="text-slate-400 block mb-1">Product / Plan Name</label>
@@ -1246,7 +1293,7 @@ app.get('/admin', (req, res) => {
               <input id="m_price" type="number" step="0.01" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
             </div>
             <div>
-              <label class="text-slate-400 block mb-1">Stock</label>
+              <label class="text-slate-400 block mb-1">Stock (0 = Red)</label>
               <input id="m_stock" type="number" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
             </div>
             <div>
@@ -1255,7 +1302,7 @@ app.get('/admin', (req, res) => {
             </div>
           </div>
           <div>
-            <label class="text-slate-400 block mb-1">Banner Image URL (Direct Link .jpg / .png)</label>
+            <label class="text-slate-400 block mb-1">Banner Image URL (.jpg / .png)</label>
             <input id="m_img" oninput="updatePreview()" placeholder="https://i.imgur.com/example.png" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
           <div>
@@ -1267,7 +1314,12 @@ app.get('/admin', (req, res) => {
 
         <!-- Live Telegram Bot Preview -->
         <div>
-          <p class="text-xs text-slate-400 mb-2">📱 Live Telegram Card Preview:</p>
+          <p class="text-xs text-slate-400 mb-2">📱 Live Catalog Button & Card Preview:</p>
+          <div class="mb-3">
+            <div id="prev_cat_btn" class="w-full py-2 px-3 rounded-lg font-bold text-xs text-center text-white bg-[#3b7a3e] transition">
+              <span id="prev_cat_label">💥 Category (10)</span>
+            </div>
+          </div>
           <div class="bg-[#182533] border border-slate-700 rounded-2xl overflow-hidden shadow-xl text-xs">
             <img id="prev_img" src="" class="w-full h-36 object-cover hidden" />
             <div class="p-4 space-y-2 text-slate-200 font-sans">
@@ -1276,7 +1328,7 @@ app.get('/admin', (req, res) => {
               <div class="text-slate-500">━━━━━━━━━━━━━━━━━━━━</div>
               <div>💵 Price: $<span id="prev_price">0.90</span>  🛒 Qty: 1  💳 Total: $<span id="prev_total">0.90</span></div>
               <div>📦 Stock: <span id="prev_stock">10</span>  📊 Sold: <span id="prev_sold">0</span> accounts</div>
-              <div class="pt-1">✅ Instant delivery</div>
+              <div id="prev_status" class="pt-1">✅ Instant delivery</div>
               <div class="text-slate-500">━━━━━━━━━━━━━━━━━━━━</div>
               <div class="font-bold">🏷️ Product Description</div>
               <div id="prev_desc" class="border-l-4 border-sky-500 bg-sky-950/40 pl-3 py-1.5 rounded text-slate-300 whitespace-pre-line"></div>
@@ -1287,7 +1339,7 @@ app.get('/admin', (req, res) => {
                 <div class="bg-[#8c4b43] text-center py-1.5 rounded font-bold">✏️ Qty: 1</div>
                 <div class="bg-[#2b5278] text-center py-1.5 rounded font-bold">+</div>
               </div>
-              <div class="bg-[#3b7a3e] text-center py-2 rounded font-bold text-white">✅ Buy (Total: $<span id="prev_btn_total">0.90</span>)</div>
+              <div id="prev_buy_btn" class="bg-[#3b7a3e] text-center py-2 rounded font-bold text-white">✅ Buy (Total: $<span id="prev_btn_total">0.90</span>)</div>
               <div class="bg-[#243447] text-center py-2 rounded font-bold">📤 Share Product</div>
               <div class="bg-[#8c4b43] text-center py-2 rounded font-bold">Back</div>
             </div>
@@ -1302,10 +1354,10 @@ app.get('/admin', (req, res) => {
     <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4 mb-6">
       <div>
         <h1 class="text-2xl font-bold text-white">⚡ Nexas Store Visual Customizer</h1>
-        <p class="text-xs text-slate-400">Customize Store Theme, Product Images, Emojis, Categories & Descriptions</p>
+        <p class="text-xs text-slate-400"> Stock > 0 = 🟢 Green Button | Stock 0 = 🔴 Red Button in Telegram</p>
       </div>
       <div class="flex gap-2">
-        <button onclick="syncNow()" id="syncBtn" class="theme-btn bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
+        <button onclick="syncNow()" id="syncBtn" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
         <button onclick="loadData()" class="bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-xl text-xs font-semibold transition">↻ Refresh</button>
         <button onclick="logout()" class="bg-rose-600/20 text-rose-400 hover:bg-rose-600/30 px-3 py-2 rounded-xl text-xs font-semibold">Logout</button>
       </div>
@@ -1314,21 +1366,15 @@ app.get('/admin', (req, res) => {
     <!-- Settings & Theme Customizer -->
     <div class="grid md:grid-cols-3 gap-6 mb-8">
       <div class="md:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5">
-        <h3 class="font-bold text-base mb-4">🎨 Store Branding, Theme Color, Payment & Supplier</h3>
+        <h3 class="font-bold text-base mb-4">🎨 Store Branding, Payment & Supplier</h3>
         <div class="grid sm:grid-cols-2 gap-3 text-xs">
           <div>
             <label class="text-slate-400 block mb-1">Store Name</label>
             <input id="s_store_name" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
           <div>
-            <label class="text-slate-400 block mb-1">Store Theme Color & Badge</label>
-            <select id="s_theme" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
-              <option value="emerald">🟢 Emerald Green (Excalibur Style)</option>
-              <option value="blue">🔵 Ocean Blue</option>
-              <option value="purple">🟣 Royal Purple</option>
-              <option value="amber">🟡 Cyber Gold</option>
-              <option value="rose">🔴 Crimson Red</option>
-            </select>
+            <label class="text-slate-400 block mb-1">Support Username</label>
+            <input id="s_support" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
           <div class="sm:col-span-2">
             <label class="text-slate-400 block mb-1">Default Store Banner Image URL (Optional)</label>
@@ -1358,15 +1404,11 @@ app.get('/admin', (req, res) => {
             <label class="text-slate-400 block mb-1">Supplier API Key</label>
             <input id="s_key" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
-          <div class="sm:col-span-2">
-            <label class="text-slate-400 block mb-1">Support Username</label>
-            <input id="s_support" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
-          </div>
         </div>
-        <button onclick="saveSettings()" class="theme-btn mt-4 bg-emerald-600 hover:bg-emerald-500 px-5 py-2.5 rounded-xl text-xs font-semibold">💾 Save All Store Settings</button>
+        <button onclick="saveSettings()" class="mt-4 bg-emerald-600 hover:bg-emerald-500 px-5 py-2.5 rounded-xl text-xs font-semibold">💾 Save All Store Settings</button>
       </div>
 
-      <!-- Add Product with Emoji, Image & Description -->
+      <!-- Add Product -->
       <div class="space-y-6">
         <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
           <h3 class="font-bold text-base mb-3">➕ Add New Custom Product</h3>
@@ -1382,7 +1424,7 @@ app.get('/admin', (req, res) => {
             </div>
             <input id="n_img" placeholder="Banner Image URL (.jpg/.png)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
             <textarea id="n_desc" rows="2" placeholder="Product Description..." class="w-full bg-slate-800 border border-slate-700 rounded-lg p-2"></textarea>
-            <button onclick="addProduct()" class="theme-btn w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-xl font-semibold">➕ Create Product</button>
+            <button onclick="addProduct()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-xl font-semibold">➕ Create Product</button>
           </div>
         </div>
 
@@ -1397,20 +1439,20 @@ app.get('/admin', (req, res) => {
     <!-- Products Visual Manager Table -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 mb-8">
       <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
-        <h3 class="font-bold text-base">🛍️ Products Visual Customizer (Click "🎨 Customize" to edit Image, Description & Preview)</h3>
+        <h3 class="font-bold text-base">🛍️ Products Manager (In-Stock = 🟢 Green Button | Stock 0 = 🔴 Red Button)</h3>
         <input id="searchProd" oninput="renderProducts()" placeholder="🔍 Search product or category..." class="bg-slate-800 border border-slate-700 rounded-xl px-3 py-1.5 text-xs w-64" />
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-xs">
           <thead class="text-slate-400 border-b border-slate-800">
             <tr>
+              <th class="pb-2">Status</th>
               <th class="pb-2">Banner</th>
               <th class="pb-2">Emoji</th>
               <th class="pb-2">Category</th>
               <th class="pb-2">Product Name</th>
               <th class="pb-2">Price ($)</th>
               <th class="pb-2">Stock</th>
-              <th class="pb-2">Sold</th>
               <th class="pb-2">Actions</th>
             </tr>
           </thead>
@@ -1493,7 +1535,6 @@ app.get('/admin', (req, res) => {
 
       const s = data.settings;
       document.getElementById('s_store_name').value = s.store_name || '';
-      document.getElementById('s_theme').value = s.theme_color || 'emerald';
       document.getElementById('s_banner').value = s.default_banner || '';
       document.getElementById('s_support').value = s.support_username || '';
       document.getElementById('s_bkash').value = s.bkash_number || '';
@@ -1533,8 +1574,14 @@ app.get('/admin', (req, res) => {
       );
 
       const pBody = document.getElementById('productsTable');
-      pBody.innerHTML = filtered.map(p => \`
+      pBody.innerHTML = filtered.map(p => {
+        const stock = Number(p.api_stock ?? 0);
+        const badge = stock > 0
+          ? '<span class="px-2 py-0.5 rounded bg-emerald-600 text-white font-bold">🟢 In Stock</span>'
+          : '<span class="px-2 py-0.5 rounded bg-rose-700 text-white font-bold">🔴 Out (0)</span>';
+        return \`
         <tr class="hover:bg-slate-800/40">
+          <td class="py-2 pr-2">\${badge}</td>
           <td class="py-2 pr-2">
             \${p.image_url ? \`<img src="\${p.image_url}" class="w-10 h-7 object-cover rounded border border-slate-700" />\` : '<span class="text-slate-600">No Img</span>'}
           </td>
@@ -1542,15 +1589,14 @@ app.get('/admin', (req, res) => {
           <td class="py-2 pr-2"><input id="p_cat_\${p.id}" value="\${(p.category||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-36" /></td>
           <td class="py-2 pr-2"><input id="p_name_\${p.id}" value="\${(p.name||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-44" /></td>
           <td class="py-2 pr-2"><input id="p_price_\${p.id}" type="number" step="0.01" value="\${p.price}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
-          <td class="py-2 pr-2"><input id="p_stock_\${p.id}" type="number" value="\${p.api_stock ?? 0}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-16" /></td>
-          <td class="py-2 pr-2 font-mono text-slate-400">\${p.sold_count ?? 0}</td>
+          <td class="py-2 pr-2"><input id="p_stock_\${p.id}" type="number" value="\${stock}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-16" /></td>
           <td class="py-2 space-x-1 whitespace-nowrap">
             <button onclick="openModal(\${p.id})" class="bg-indigo-600 hover:bg-indigo-500 px-2.5 py-1 rounded font-semibold">🎨 Customize</button>
             <button onclick="quickSaveProd(\${p.id})" class="bg-emerald-600 hover:bg-emerald-500 px-2.5 py-1 rounded font-semibold">💾</button>
             <button onclick="delProd(\${p.id})" class="bg-rose-600/30 text-rose-300 hover:bg-rose-600 px-2 py-1 rounded">🗑️</button>
           </td>
-        </tr>
-      \`).join('');
+        </tr>\`;
+      }).join('');
     }
 
     function openModal(id) {
@@ -1558,6 +1604,7 @@ app.get('/admin', (req, res) => {
       if (!p) return;
       document.getElementById('m_id').value = p.id;
       document.getElementById('m_emoji').value = p.emoji || '💥';
+      document.getElementById('m_custom_emoji').value = p.custom_emoji_id || '';
       document.getElementById('m_cat').value = p.category || '';
       document.getElementById('m_name').value = p.name || '';
       document.getElementById('m_price').value = p.price || 0;
@@ -1575,9 +1622,10 @@ app.get('/admin', (req, res) => {
 
     function updatePreview() {
       const emoji = document.getElementById('m_emoji').value || '💥';
+      const cat = document.getElementById('m_cat').value || 'Category';
       const name = document.getElementById('m_name').value || 'Product Name';
       const price = Number(document.getElementById('m_price').value || 0).toFixed(2);
-      const stock = document.getElementById('m_stock').value || 0;
+      const stock = Number(document.getElementById('m_stock').value || 0);
       const sold = document.getElementById('m_sold').value || 0;
       const img = document.getElementById('m_img').value.trim();
       const desc = document.getElementById('m_desc').value || 'Automatically fulfilled through Nexas Cloud Store.';
@@ -1586,10 +1634,25 @@ app.get('/admin', (req, res) => {
       document.getElementById('prev_name').innerText = name;
       document.getElementById('prev_price').innerText = price;
       document.getElementById('prev_total').innerText = price;
-      document.getElementById('prev_btn_total').innerText = price;
       document.getElementById('prev_stock').innerText = stock;
       document.getElementById('prev_sold').innerText = sold;
       document.getElementById('prev_desc').innerText = desc;
+
+      const catBtn = document.getElementById('prev_cat_btn');
+      const buyBtn = document.getElementById('prev_buy_btn');
+      document.getElementById('prev_cat_label').innerText = \`\${emoji} \${cat} (\${stock})\`;
+
+      if (stock > 0) {
+        catBtn.className = 'w-full py-2 px-3 rounded-lg font-bold text-xs text-center text-white bg-[#3b7a3e]';
+        buyBtn.className = 'bg-[#3b7a3e] text-center py-2 rounded font-bold text-white';
+        buyBtn.innerHTML = \`✅ Buy (Total: $\${price})\`;
+        document.getElementById('prev_status').innerText = '✅ Instant delivery';
+      } else {
+        catBtn.className = 'w-full py-2 px-3 rounded-lg font-bold text-xs text-center text-white bg-[#8c4b43]';
+        buyBtn.className = 'bg-[#8c4b43] text-center py-2 rounded font-bold text-white';
+        buyBtn.innerHTML = \`❌ Out of Stock ($\${price})\`;
+        document.getElementById('prev_status').innerText = '❌ Out of Stock';
+      }
 
       const imgEl = document.getElementById('prev_img');
       if (img && img.startsWith('http')) {
@@ -1605,6 +1668,7 @@ app.get('/admin', (req, res) => {
       await api('/api/admin/product/update', 'POST', {
         id,
         emoji: document.getElementById('m_emoji').value,
+        custom_emoji_id: document.getElementById('m_custom_emoji').value,
         category: document.getElementById('m_cat').value,
         name: document.getElementById('m_name').value,
         price: document.getElementById('m_price').value,
@@ -1622,6 +1686,7 @@ app.get('/admin', (req, res) => {
       await api('/api/admin/product/update', 'POST', {
         id,
         emoji: document.getElementById('p_emoji_' + id).value,
+        custom_emoji_id: p?.custom_emoji_id || '',
         category: document.getElementById('p_cat_' + id).value,
         name: document.getElementById('p_name_' + id).value,
         price: document.getElementById('p_price_' + id).value,
@@ -1637,7 +1702,6 @@ app.get('/admin', (req, res) => {
     async function saveSettings() {
       await api('/api/admin/settings', 'POST', {
         store_name: document.getElementById('s_store_name').value,
-        theme_color: document.getElementById('s_theme').value,
         default_banner: document.getElementById('s_banner').value,
         support_username: document.getElementById('s_support').value,
         bkash_number: document.getElementById('s_bkash').value,
@@ -1647,7 +1711,7 @@ app.get('/admin', (req, res) => {
         supplier_base_url: document.getElementById('s_url').value,
         supplier_api_key: document.getElementById('s_key').value
       });
-      alert('✅ Store Settings & Theme Saved!');
+      alert('✅ Store Settings Saved!');
       loadData();
     }
 
