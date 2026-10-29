@@ -16,7 +16,6 @@ app.use(express.urlencoded({ extended: true }));
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const pendingCheckouts = new Map();
 
-// ড্যাশবোর্ডে লগইন করার পাসওয়ার্ড (চাইলে Render Environment-এ ADMIN_PASSWORD যোগ করতে পারেন, না দিলে WEBHOOK_SECRET বা admin123 কাজ করবে)
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || process.env.WEBHOOK_SECRET || 'admin123';
 
 bot.telegram.setMyCommands([
@@ -28,9 +27,13 @@ bot.telegram.setMyCommands([
 ]).catch(console.error);
 
 // ==========================================
-// SMART EMOJI MAPPER & HELPERS
+// SMART EMOJI & THEME HELPERS
 // ==========================================
-function getProductEmoji(name = '') {
+function getProductEmoji(productOrName = '', customEmoji = '') {
+  if (customEmoji && customEmoji.trim() !== '') return customEmoji.trim() + ' ';
+  const name = typeof productOrName === 'object' ? (productOrName.category || productOrName.name || '') : productOrName;
+  if (typeof productOrName === 'object' && productOrName.emoji) return productOrName.emoji.trim() + ' ';
+
   const n = name.toLowerCase();
   if (/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/u.test(name.slice(0, 4))) return '';
   if (n.includes('gemini')) return '✨ ';
@@ -45,13 +48,42 @@ function getProductEmoji(name = '') {
   if (n.includes('netflix') || n.includes('prime') || n.includes('apple tv') || n.includes('shahid')) return '🍿 ';
   if (n.includes('duolingo') || n.includes('coursera') || n.includes('udemy') || n.includes('scribd') || n.includes('edu')) return '🎓 ';
   if (n.includes('elevenlabs') || n.includes('suno') || n.includes('wispr')) return '🎙️ ';
-  return '📦 ';
+  return '💥 ';
 }
 
-function getStockStatusIcon(stock) {
+function getThemeBadge(themeColor = 'emerald') {
+  const map = { emerald: '🟢', blue: '🔵', purple: '🟣', amber: '🟡', rose: '🔴' };
+  return map[themeColor] || '🟢';
+}
+
+function getStockStatusIcon(stock, themeColor = 'emerald') {
   if (stock <= 0) return '🔴';
   if (stock <= 5) return '🟡';
-  return '🟢';
+  return getThemeBadge(themeColor);
+}
+
+// Chobi thakle ebong na thakle smoothly message update korar helper
+async function renderScreen(ctx, text, keyboard, imageUrl = null, isEdit = true) {
+  const extra = { parse_mode: 'HTML', ...keyboard };
+  try {
+    if (imageUrl && imageUrl.startsWith('http')) {
+      if (isEdit && ctx.callbackQuery?.message) {
+        await ctx.deleteMessage().catch(() => {});
+      }
+      return await ctx.replyWithPhoto(imageUrl, { caption: text, ...extra });
+    } else {
+      if (isEdit && ctx.callbackQuery?.message) {
+        if (ctx.callbackQuery.message.photo) {
+          await ctx.deleteMessage().catch(() => {});
+          return await ctx.reply(text, extra);
+        }
+        return await ctx.editMessageText(text, extra);
+      }
+      return await ctx.reply(text, extra);
+    }
+  } catch (err) {
+    return await ctx.reply(text, extra).catch(() => {});
+  }
 }
 
 async function getUser(ctx, startPayload = null) {
@@ -71,7 +103,6 @@ async function getUser(ctx, startPayload = null) {
   return user;
 }
 
-// ডাটাবেস থেকে সব ডায়নামিক সেটিংস আনা
 async function getSupplierConfig() {
   const { data } = await supabase.from('settings').select('*').eq('id', 1).single();
   return {
@@ -82,7 +113,9 @@ async function getSupplierConfig() {
     usd_to_bdt_rate: Number(data?.usd_to_bdt_rate || process.env.USD_TO_BDT_RATE || 130),
     bkash_number: data?.bkash_number || process.env.MY_BKASH_NUMBER || '01708994003',
     binance_pay_id: data?.binance_pay_id || process.env.BINANCE_PAY_ID || '988336275',
-    support_username: data?.support_username || process.env.SUPPORT_USERNAME || '@mehedihasanantu'
+    support_username: data?.support_username || process.env.SUPPORT_USERNAME || '@mehedihasanantu',
+    theme_color: data?.theme_color || 'emerald',
+    default_banner: data?.default_banner || ''
   };
 }
 
@@ -99,7 +132,7 @@ async function getProductStock(product) {
 }
 
 // ==========================================
-// REUSABLE SUPPLIER SYNC ENGINE
+// SUPPLIER SYNC ENGINE (PRESERVES CUSTOM IMAGE & EMOJI)
 // ==========================================
 async function runSupplierSync() {
   const sup = await getSupplierConfig();
@@ -129,7 +162,8 @@ async function runSupplierSync() {
   for (const item of list) {
     const suppId = String(item.id ?? item.product_id ?? item._id);
     const rawName = (item.name || item.title || 'Digital Product').trim();
-    const emojiPrefix = item.emoji || item.icon ? `${item.emoji || item.icon} ` : '';
+    const itemEmoji = item.emoji || item.icon || '';
+    const itemImage = item.image || item.image_url || item.banner || '';
     
     let category = item.category || item.group || rawName;
     let planName = item.plan || item.variant || rawName;
@@ -140,10 +174,6 @@ async function runSupplierSync() {
       planName = parts.slice(1).join(' - ').trim();
     }
 
-    if (emojiPrefix && !category.startsWith(emojiPrefix.trim())) {
-      category = `${emojiPrefix}${category}`;
-    }
-
     const basePrice = parseFloat(item.price ?? item.cost ?? 1.0);
     const sellPrice = Number((basePrice * (1 + margin / 100)).toFixed(2));
     
@@ -151,26 +181,38 @@ async function runSupplierSync() {
     let stock = rawStock !== undefined && rawStock !== null ? Number(rawStock) : 50;
     if (isNaN(stock) || stock < 0) stock = 0;
 
-    const desc = item.description || item.details || '• Instant Automated Delivery\n• Activate on your own account';
+    const desc = item.description || item.details || 'Automatically fulfilled through Nexas Cloud Store.';
 
     const { data: existing } = await supabase
       .from('products')
-      .select('id')
+      .select('*')
       .eq('type', 'api')
       .eq('supplier_product_id', suppId)
       .maybeSingle();
 
     if (existing) {
+      // Update stock & price, kintu admin jodi custom image/emoji diye thake seta muche jabe na
       await supabase.from('products').update({
-        category, name: planName, price: sellPrice, description: desc,
-        api_stock: stock, supplier_api_url: orderEndpoint, supplier_api_key: sup.supplier_api_key
+        price: sellPrice,
+        api_stock: stock,
+        supplier_api_url: orderEndpoint,
+        supplier_api_key: sup.supplier_api_key
       }).eq('id', existing.id);
       updated++;
     } else {
       await supabase.from('products').insert([{
-        category, name: planName, price: sellPrice, description: desc,
-        type: 'api', api_stock: stock, supplier_api_url: orderEndpoint,
-        supplier_api_key: sup.supplier_api_key, supplier_product_id: suppId
+        category,
+        name: planName,
+        price: sellPrice,
+        description: desc,
+        type: 'api',
+        api_stock: stock,
+        emoji: itemEmoji,
+        image_url: itemImage,
+        sold_count: 0,
+        supplier_api_url: orderEndpoint,
+        supplier_api_key: sup.supplier_api_key,
+        supplier_product_id: suppId
       }]);
       added++;
     }
@@ -242,7 +284,7 @@ function extractRealDeliveryItems(obj) {
 }
 
 // ==========================================
-// ORDER DELIVERY (LOCAL + PRODSELLER API)
+// ORDER DELIVERY
 // ==========================================
 async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
   let deliveredItems = [];
@@ -307,10 +349,6 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
       if (deliveredItems.length === 0) {
         deliveredItems = [JSON.stringify(resData)];
       }
-
-      if (product.api_stock && product.api_stock >= qty) {
-        await supabase.from('products').update({ api_stock: product.api_stock - qty }).eq('id', product.id);
-      }
     } catch (err) {
       const errMsg = err.response?.data?.error || err.response?.data?.message || err.message || 'Supplier API Error';
       return {
@@ -319,6 +357,11 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
       };
     }
   }
+
+  // Update Stock & Sold Count
+  const newSold = Number(product.sold_count || 0) + Number(qty);
+  const newApiStock = product.type === 'api' && product.api_stock >= qty ? product.api_stock - qty : product.api_stock;
+  await supabase.from('products').update({ sold_count: newSold, api_stock: newApiStock }).eq('id', product.id);
 
   const orderId = 'ORD-' + Date.now() + Math.floor(10 + Math.random() * 90);
   const deliveredText = deliveredItems.join('\n\n');
@@ -331,7 +374,7 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     delivered_data: deliveredText
   }]);
 
-  const emoji = getProductEmoji(product.category || product.name);
+  const emoji = getProductEmoji(product);
   const msg =
     `🎉 <b>PAYMENT VERIFIED SUCCESSFULLY!</b> 🎉\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -342,7 +385,7 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
     `📋 <b>YOUR INVITATION / ACCESS LINK(S):</b>\n` +
     `<code>${deliveredText}</code>\n\n` +
     `📌 <b>Important Instructions:</b>\n` +
-    `${product.description || '• Activate on your own account'}`;
+    `<blockquote>${product.description || '• Activate on your own account'}</blockquote>`;
 
   const keyboard = Markup.inlineKeyboard([
     [
@@ -355,13 +398,21 @@ async function deliverProductToUser(user, product, qty, paidText, totalUsd) {
 }
 
 // ==========================================
-// 1. Main Menu UI
+// 1. Main Menu UI (Supports Deep Link Product Share)
 // ==========================================
 async function sendMainMenu(ctx, isEdit = false) {
   pendingCheckouts.delete(ctx.from.id);
   const user = await getUser(ctx);
   const cfg = await getSupplierConfig();
-  const text = `Welcome to <b>${cfg.store_name}</b> ❗️\n👋🏻 Hello! ${user.name}\n\n📌 <b>Account Details</b>\n💳 Telegram ID: <code>${user.telegram_id}</code>\n💰 Balance: <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\nChoose below ⬇️`;
+  const badge = getThemeBadge(cfg.theme_color);
+
+  const text =
+    `Welcome to <b>${cfg.store_name}</b> ${badge}\n` +
+    `👋🏻 Hello! <b>${user.name}</b>\n\n` +
+    `📌 <b>Account Details</b>\n` +
+    `💳 Telegram ID: <code>${user.telegram_id}</code>\n` +
+    `💰 Balance: <b>$${Number(user.balance).toFixed(2)} USDT</b>\n\n` +
+    `Choose below ⬇️`;
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Cloud Store Catalog', 'menu_shop'), Markup.button.callback('💰 Wallet', 'menu_wallet')],
@@ -370,11 +421,20 @@ async function sendMainMenu(ctx, isEdit = false) {
     [Markup.button.callback('🛟 Support', 'menu_support'), Markup.button.callback('🔑 API Access', 'menu_apikey')]
   ]);
 
-  if (isEdit) return ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
-  return ctx.reply(text, { parse_mode: 'HTML', ...keyboard });
+  return renderScreen(ctx, text, keyboard, cfg.default_banner, isEdit);
 }
 
-bot.start((ctx) => { getUser(ctx, ctx.startPayload); sendMainMenu(ctx, false); });
+bot.start(async (ctx) => {
+  const payload = ctx.startPayload;
+  await getUser(ctx, payload);
+  // Jodi keu Share Product link theke ashe (e.g. ?start=prod_12)
+  if (payload && payload.startsWith('prod_')) {
+    const prodId = Number(payload.replace('prod_', ''));
+    if (prodId) return showProductView(ctx, prodId, 1, false);
+  }
+  return sendMainMenu(ctx, false);
+});
+
 bot.command('menu', (ctx) => sendMainMenu(ctx, false));
 bot.action('main_menu', (ctx) => { ctx.answerCbQuery(); sendMainMenu(ctx, true); });
 
@@ -383,12 +443,13 @@ bot.action('main_menu', (ctx) => { ctx.answerCbQuery(); sendMainMenu(ctx, true);
 // ==========================================
 async function showCatalog(ctx, isEdit = true) {
   pendingCheckouts.delete(ctx.from.id);
+  const cfg = await getSupplierConfig();
   const { data: products } = await supabase.from('products').select('*').order('id', { ascending: true });
 
   if (!products || products.length === 0) {
-    const emptyMsg = '🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Currently kono product stock-e nei.\n\n<i>Admin hole /sync command diye supplier theke auto-import korun!</i>';
+    const emptyMsg = '🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n📦 Currently kono product stock-e nei.\n\n<i>Admin hole /sync command ba Web Dashboard theke import korun!</i>';
     const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]]);
-    return isEdit ? ctx.editMessageText(emptyMsg, { parse_mode: 'HTML', ...kb }) : ctx.reply(emptyMsg, { parse_mode: 'HTML', ...kb });
+    return renderScreen(ctx, emptyMsg, kb, null, isEdit);
   }
 
   const categories = {};
@@ -396,7 +457,7 @@ async function showCatalog(ctx, isEdit = true) {
     const catName = p.category || p.name;
     const stock = await getProductStock(p);
     if (!categories[catName]) {
-      categories[catName] = { name: catName, totalStock: 0, firstProdId: p.id };
+      categories[catName] = { name: catName, totalStock: 0, firstProd: p };
     }
     categories[catName].totalStock += stock;
   }
@@ -408,25 +469,24 @@ async function showCatalog(ctx, isEdit = true) {
   for (let i = 0; i < catList.length; i += 2) {
     const row = [];
     const c1 = catList[i];
-    const emoji1 = getProductEmoji(c1.name);
-    const status1 = getStockStatusIcon(c1.totalStock);
-    row.push(Markup.button.callback(`${emoji1}${c1.name} (${c1.totalStock}) ${status1}`, `cat_${c1.firstProdId}`));
+    const emoji1 = getProductEmoji(c1.firstProd);
+    const status1 = getStockStatusIcon(c1.totalStock, cfg.theme_color);
+    row.push(Markup.button.callback(`${emoji1}${c1.name} (${c1.totalStock}) ${status1}`, `cat_${c1.firstProd.id}`));
 
     if (catList[i + 1]) {
       const c2 = catList[i + 1];
-      const emoji2 = getProductEmoji(c2.name);
-      const status2 = getStockStatusIcon(c2.totalStock);
-      row.push(Markup.button.callback(`${emoji2}${c2.name} (${c2.totalStock}) ${status2}`, `cat_${c2.firstProdId}`));
+      const emoji2 = getProductEmoji(c2.firstProd);
+      const status2 = getStockStatusIcon(c2.totalStock, cfg.theme_color);
+      row.push(Markup.button.callback(`${emoji2}${c2.name} (${c2.totalStock}) ${status2}`, `cat_${c2.firstProd.id}`));
     }
     buttons.push(row);
   }
 
   buttons.push([Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]);
 
-  const text = `🌈 <b>CLOUD STORE CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n🚀 Instant Delivery 24/7\n📦 Total Products: <b>${catList.length}</b>\n\n👇 Choose a product below :`;
+  const text = `🌈 <b>${cfg.store_name.toUpperCase()} — CATALOG</b>\n━━━━━━━━━━━━━━━━━━━━\n🚀 Instant Delivery 24/7\n📦 Total Categories: <b>${catList.length}</b>\n\n👇 Choose a product below :`;
 
-  if (isEdit) return ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
-  return ctx.reply(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) });
+  return renderScreen(ctx, text, Markup.inlineKeyboard(buttons), cfg.default_banner, isEdit);
 }
 
 bot.action('menu_shop', (ctx) => { ctx.answerCbQuery(); showCatalog(ctx, true); });
@@ -438,72 +498,145 @@ bot.command('products', (ctx) => showCatalog(ctx, false));
 bot.action(/cat_(\d+)/, async (ctx) => {
   ctx.answerCbQuery();
   pendingCheckouts.delete(ctx.from.id);
-  const firstProdId = ctx.match[1];
+  const firstProdId = Number(ctx.match[1]);
   const { data: firstProd } = await supabase.from('products').select('*').eq('id', firstProdId).single();
   if (!firstProd) return;
 
   const catName = firstProd.category || firstProd.name;
-  const { data: variants } = await supabase.from('products').select('*').eq('category', catName);
-  const emoji = getProductEmoji(catName);
+  const { data: variants } = await supabase.from('products').select('*').eq('category', catName).order('id', { ascending: true });
 
+  // Jodi ei category-te matro 1ti plan thake, tahole soraSori Screenshot-er moto Product Card open hobe!
+  if (variants && variants.length === 1) {
+    return showProductView(ctx, variants[0].id, 1, true, true);
+  }
+
+  const cfg = await getSupplierConfig();
+  const emoji = getProductEmoji(firstProd);
   const buttons = [];
+
   for (const v of (variants || [firstProd])) {
     const stock = await getProductStock(v);
-    const btnIcon = getStockStatusIcon(stock);
+    const btnIcon = getStockStatusIcon(stock, cfg.theme_color);
+    const vEmoji = v.emoji ? `${v.emoji} ` : '';
     buttons.push([
-      Markup.button.callback(`${btnIcon} ${v.name} - $${Number(v.price).toFixed(2)} USDT [Stock: ${stock}]`, `sel_${v.id}_1`)
+      Markup.button.callback(`${btnIcon} ${vEmoji}${v.name} — $${Number(v.price).toFixed(2)} [Stock: ${stock}]`, `sel_${v.id}_1`)
     ]);
   }
   buttons.push([Markup.button.callback('🔙 Back to Catalog', 'menu_shop')]);
 
-  const text = `🛒 <b>PRODUCT - ${emoji}${catName}</b>\n━━━━━━━━━━━━━━━━━━━━\n${firstProd.description || 'Instant Digital Delivery.'}\n\n⚠️ <b>Warning:</b> By purchasing, you confirm that you have read the product description and agree to our store policies. Please purchase at your own risk.\n\n👇 <b>Choose a plan/variant:</b>`;
+  const text =
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `${emoji}<b>${catName}</b> ✅\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🏷️ <b>Category Description</b>\n` +
+    `<blockquote>${firstProd.description || 'Automatically fulfilled through Nexas Cloud Store.'}</blockquote>\n\n` +
+    `👇 <b>Select a plan below:</b>`;
 
-  ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(() => {});
+  const banner = firstProd.image_url || cfg.default_banner;
+  return renderScreen(ctx, text, Markup.inlineKeyboard(buttons), banner, true);
 });
 
 // ==========================================
-// 4. Quantity Selector & Payment Options
+// 4. Excalibur-Style Product Card (Image + Sold + Quote + Share)
 // ==========================================
-bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
-  ctx.answerCbQuery();
+async function showProductView(ctx, prodId, qty = 1, isEdit = true, fromCatalog = false) {
   pendingCheckouts.delete(ctx.from.id);
-  const prodId = Number(ctx.match[1]);
-  let qty = Number(ctx.match[2]);
   if (qty < 1) qty = 1;
 
-  const user = await getUser(ctx);
+  const cfg = await getSupplierConfig();
   const { data: product } = await supabase.from('products').select('*').eq('id', prodId).single();
   if (!product) return;
 
   const stock = await getProductStock(product);
   if (qty > stock && stock > 0) qty = stock;
 
+  const unitPrice = Number(product.price).toFixed(2);
   const totalPrice = (Number(product.price) * qty).toFixed(2);
   const minusQty = qty > 1 ? qty - 1 : 1;
   const plusQty = stock > qty ? qty + 1 : qty;
-  const emoji = getProductEmoji(product.category || product.name);
+  const emoji = getProductEmoji(product);
+  const soldCount = Number(product.sold_count || 0);
 
-  const text = `${emoji}<b>${product.category} - ${product.name}</b>\n━━━━━━━━━━━━━━━━━━━━\n💲 <b>Price:</b> $${Number(product.price).toFixed(2)} USDT per unit\n📦 <b>Stock:</b> ${stock} available\n👛 <b>Your Wallet Balance:</b> $${Number(user.balance).toFixed(2)} USDT\n\n📋 <b>Details:</b>\n${product.description}\n\n🧮 <b>Select Quantity:</b>`;
+  const botUsername = (process.env.BOT_USERNAME || 'nexas_shopbot').replace('@', '');
+  const shareLink = `https://t.me/${botUsername}?start=prod_${prodId}`;
+  const shareText = encodeURIComponent(`🔥 Check out ${product.name} ($${unitPrice}) on ${cfg.store_name}!`);
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(shareLink)}&text=${shareText}`;
+
+  // Exact Excalibur TechBot Layout from your Screenshot!
+  const text =
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `${emoji}<b>${product.name}</b> ✅\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💵 Price: $${unitPrice}  🛒 Qty: ${qty}  💳 Total: $${totalPrice}\n` +
+    `📦 Stock: ${stock}  📊 Sold: ${soldCount} accounts\n\n` +
+    `✅ Instant delivery\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🏷️ <b>Product Description</b>\n` +
+    `<blockquote>${product.description || 'Automatically fulfilled through Nexas Cloud Store.'}</blockquote>`;
+
+  const backAction = fromCatalog ? 'menu_shop' : `cat_${prodId}`;
 
   const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('➖', `sel_${prodId}_${minusQty}`),
+      Markup.button.callback(`✏️ Qty: ${qty}`, `noop`),
+      Markup.button.callback('➕', `sel_${prodId}_${plusQty}`)
+    ],
     [
       Markup.button.callback('5', `sel_${prodId}_5`),
       Markup.button.callback('10', `sel_${prodId}_10`),
       Markup.button.callback('50', `sel_${prodId}_50`),
       Markup.button.callback('100', `sel_${prodId}_100`)
     ],
-    [
-      Markup.button.callback('➖', `sel_${prodId}_${minusQty}`),
-      Markup.button.callback(`Qty: ${qty}`, `noop`),
-      Markup.button.callback('➕', `sel_${prodId}_${plusQty}`)
-    ],
-    [Markup.button.callback(`👛 Pay with Balance ($${totalPrice} USDT)`, `buy_${prodId}_${qty}`)],
-    [Markup.button.callback(`🟡 Pay with Binance ($${totalPrice} USDT)`, `chk_bn_${prodId}_${qty}`)],
-    [Markup.button.callback(`📱 Pay with bKash ($${totalPrice} USDT)`, `chk_bk_${prodId}_${qty}`)],
-    [Markup.button.callback('⬅️ Back to Plans', `cat_${prodId}`)]
+    [Markup.button.callback(`✅ Buy (Total: $${totalPrice})`, `paymenu_${prodId}_${qty}`)],
+    [Markup.button.url('📤 Share Product', shareUrl)],
+    [Markup.button.callback('Back', backAction)]
   ]);
 
-  ctx.editMessageText(text, { parse_mode: 'HTML', ...keyboard }).catch(() => {});
+  const banner = product.image_url || cfg.default_banner;
+  return renderScreen(ctx, text, keyboard, banner, isEdit);
+}
+
+bot.action(/sel_(\d+)_(\d+)/, async (ctx) => {
+  ctx.answerCbQuery();
+  const prodId = Number(ctx.match[1]);
+  const qty = Number(ctx.match[2]);
+  return showProductView(ctx, prodId, qty, true);
+});
+
+// Buy Button click korle Payment Method Selector open hobe
+bot.action(/paymenu_(\d+)_(\d+)/, async (ctx) => {
+  ctx.answerCbQuery();
+  const prodId = Number(ctx.match[1]);
+  const qty = Number(ctx.match[2]);
+
+  const user = await getUser(ctx);
+  const cfg = await getSupplierConfig();
+  const { data: product } = await supabase.from('products').select('*').eq('id', prodId).single();
+  if (!product) return;
+
+  const totalPrice = (Number(product.price) * qty).toFixed(2);
+  const totalBdt = Math.ceil(Number(totalPrice) * cfg.usd_to_bdt_rate);
+  const emoji = getProductEmoji(product);
+
+  const text =
+    `💳 <b>SELECT PAYMENT METHOD</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `🛍️ <b>Product:</b> ${emoji}${product.name}\n` +
+    `🛒 <b>Quantity:</b> ${qty}\n` +
+    `💵 <b>Total Payable:</b> <b>$${totalPrice} USDT</b> (or ${totalBdt} BDT)\n` +
+    `👛 <b>Your Wallet Balance:</b> $${Number(user.balance).toFixed(2)} USDT\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `👇 Choose how you want to pay:`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(`👛 Pay with Wallet Balance ($${totalPrice})`, `buy_${prodId}_${qty}`)],
+    [Markup.button.callback(`🟡 Pay with Binance Pay ($${totalPrice})`, `chk_bn_${prodId}_${qty}`)],
+    [Markup.button.callback(`📱 Pay with Personal bKash (${totalBdt} BDT)`, `chk_bk_${prodId}_${qty}`)],
+    [Markup.button.callback('⬅️ Back to Product', `sel_${prodId}_${qty}`)]
+  ]);
+
+  return renderScreen(ctx, text, keyboard, product.image_url || cfg.default_banner, true);
 });
 
 bot.action('noop', (ctx) => ctx.answerCbQuery());
@@ -529,7 +662,7 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
   const totalUsd = Number((Number(product.price) * qty).toFixed(2));
   const rate = cfg.usd_to_bdt_rate;
   const totalBdt = Math.ceil(totalUsd * rate);
-  const emoji = getProductEmoji(product.category || product.name);
+  const emoji = getProductEmoji(product);
 
   pendingCheckouts.set(ctx.from.id, {
     type: 'product',
@@ -545,8 +678,7 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
     const text =
       `💳 <b>CHECKOUT & PAYMENT INSTRUCTIONS</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🎁 <b>Item:</b> ${emoji}${product.category}\n` +
-      `🏅 <b>Plan:</b> ${product.name}\n` +
+      `🎁 <b>Item:</b> ${emoji}${product.name}\n` +
       `🧮 <b>Quantity:</b> <code>${qty}</code>\n` +
       `💲 <b>Total Amount:</b> <code>${totalUsd.toFixed(2)} USDT</code>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -560,19 +692,15 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🕒 <b>Waiting for your Transfer Order ID •••</b> <i>( Expires in 5 minutes )</i>`;
 
-    ctx.editMessageText(text, {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('❓ Where is my Order ID?', 'help_orderid')],
-        [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
-      ])
-    }).catch(() => {});
+    return renderScreen(ctx, text, Markup.inlineKeyboard([
+      [Markup.button.callback('❓ Where is my Order ID?', 'help_orderid')],
+      [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
+    ]), null, true);
   } else {
     const text =
       `💳 <b>CHECKOUT & PAYMENT INSTRUCTIONS</b>\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
-      `🎁 <b>Item:</b> ${emoji}${product.category}\n` +
-      `🏅 <b>Plan:</b> ${product.name}\n` +
+      `🎁 <b>Item:</b> ${emoji}${product.name}\n` +
       `🧮 <b>Quantity:</b> <code>${qty}</code>\n` +
       `💲 <b>Total Amount:</b> <code>${totalBdt} BDT</code> ($${totalUsd.toFixed(2)} USDT)\n` +
       `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -586,12 +714,9 @@ bot.action(/chk_(bn|bk)_(\d+)_(\d+)/, async (ctx) => {
       `━━━━━━━━━━━━━━━━━━━━\n` +
       `🕒 <b>Waiting for your bKash TrxID •••</b> <i>( Expires in 5 minutes )</i>`;
 
-    ctx.editMessageText(text, {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
-      ])
-    }).catch(() => {});
+    return renderScreen(ctx, text, Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancel Order', `sel_${prodId}_${qty}`)]
+    ]), null, true);
   }
 });
 
@@ -631,10 +756,7 @@ bot.action(/buy_(\d+)_(\d+)/, async (ctx) => {
   const newBalance = Number(user.balance) - totalPrice;
   await supabase.from('users').update({ balance: newBalance }).eq('telegram_id', user.telegram_id);
 
-  ctx.editMessageText(result.message, {
-    parse_mode: 'HTML',
-    ...result.keyboard
-  }).catch(() => {});
+  return renderScreen(ctx, result.message, result.keyboard, null, true);
 });
 
 // ==========================================
@@ -648,7 +770,7 @@ async function showWallet(ctx, isEdit = true) {
     [Markup.button.callback('🟡 Binance Pay (Auto)', 'dep_binance'), Markup.button.callback('📱 Personal bKash (Auto)', 'dep_bkash')],
     [Markup.button.callback('⬅️ Back to Main Menu', 'main_menu')]
   ]);
-  return isEdit ? ctx.editMessageText(text, { parse_mode: 'HTML', ...kb }) : ctx.reply(text, { parse_mode: 'HTML', ...kb });
+  return renderScreen(ctx, text, kb, null, isEdit);
 }
 
 bot.action('menu_wallet', (ctx) => { ctx.answerCbQuery(); showWallet(ctx, true); });
@@ -658,9 +780,12 @@ bot.action('dep_binance', async (ctx) => {
   ctx.answerCbQuery();
   const cfg = await getSupplierConfig();
   pendingCheckouts.set(ctx.from.id, { type: 'wallet', method: 'binance', expiresAt: Date.now() + 10 * 60 * 1000 });
-  ctx.editMessageText(
+  return renderScreen(
+    ctx,
     `🟡 <b>WALLET DEPOSIT - BINANCE PAY</b>\n━━━━━━━━━━━━━━━━━━━━\n1️⃣ Open Binance App ➔ <b>Pay ➔ Send</b>\n2️⃣ Send USDT to Binance ID: <code>${cfg.binance_pay_id}</code>\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>Transfer Order ID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your Order ID •••</b>`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]) }
+    Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]),
+    null,
+    true
   );
 });
 
@@ -668,9 +793,12 @@ bot.action('dep_bkash', async (ctx) => {
   ctx.answerCbQuery();
   const cfg = await getSupplierConfig();
   pendingCheckouts.set(ctx.from.id, { type: 'wallet', method: 'bkash', expiresAt: Date.now() + 10 * 60 * 1000 });
-  ctx.editMessageText(
+  return renderScreen(
+    ctx,
     `📱 <b>WALLET DEPOSIT - PERSONAL BKASH</b>\n━━━━━━━━━━━━━━━━━━━━\n📞 <b>bKash Number:</b> <code>${cfg.bkash_number}</code>\n💱 <b>Rate:</b> $1 = ${cfg.usd_to_bdt_rate} BDT\n\n✅ <b>AFTER PAYING:</b>\nSend your <b>bKash TrxID</b> directly in this chat!\n━━━━━━━━━━━━━━━━━━━━\n🕒 <b>Waiting for your TrxID •••</b>`,
-    { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]) }
+    Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_wallet')]]),
+    null,
+    true
   );
 });
 
@@ -698,46 +826,49 @@ bot.command('api', async (ctx) => {
 bot.action('menu_apikey', async (ctx) => {
   ctx.answerCbQuery();
   const user = await getUser(ctx);
-  ctx.editMessageText(`🔑 <b>Reseller API Key</b>\n\n<code>${user.api_key}</code>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  return renderScreen(ctx, `🔑 <b>Reseller API Key</b>\n\n<code>${user.api_key}</code>`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
 });
 
 bot.action('menu_orders', async (ctx) => {
   ctx.answerCbQuery();
   const { data: orders } = await supabase.from('orders').select('*').eq('telegram_id', ctx.from.id).order('created_at', { ascending: false }).limit(5);
-  if (!orders || orders.length === 0) return ctx.editMessageText('🧾 Kono order pawa jayni.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]));
+  if (!orders || orders.length === 0) return renderScreen(ctx, '🧾 Kono order pawa jayni.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
   let text = '🧾 <b>Recent Orders:</b>\n\n';
   orders.forEach(o => { text += `🔹 <code>${o.id}</code> | ${o.product_name} ($${o.price})\n🔑 <code>${o.delivered_data}</code>\n\n`; });
-  ctx.editMessageText(text, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  return renderScreen(ctx, text, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
 });
 
 bot.action('menu_refer', async (ctx) => {
   ctx.answerCbQuery();
   const user = await getUser(ctx);
   const { count } = await supabase.from('users').select('*', { count: 'exact', head: true }).eq('referred_by', user.telegram_id);
-  ctx.editMessageText(`💰 <b>Refer & Earn</b>\n\n👥 Total Referrals: ${count || 0}\n🔗 Link: <code>https://t.me/${process.env.BOT_USERNAME.replace('@','')}?start=${user.telegram_id}</code>`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  return renderScreen(ctx, `💰 <b>Refer & Earn</b>\n\n👥 Total Referrals: ${count || 0}\n🔗 Link: <code>https://t.me/${(process.env.BOT_USERNAME||'').replace('@','')}?start=${user.telegram_id}</code>`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
 });
 
 bot.action('menu_profile', async (ctx) => {
   ctx.answerCbQuery();
   const user = await getUser(ctx);
-  ctx.editMessageText(`🛡️ <b>My Profile</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>Name:</b> ${user.name}\n🆔 <b>Telegram ID:</b> <code>${user.telegram_id}</code>\n💰 <b>Balance:</b> $${Number(user.balance).toFixed(2)} USDT`, {
-    parse_mode: 'HTML',
-    ...Markup.inlineKeyboard([
+  return renderScreen(
+    ctx,
+    `🛡️ <b>My Profile</b>\n━━━━━━━━━━━━━━━━━━━━\n👤 <b>Name:</b> ${user.name}\n🆔 <b>Telegram ID:</b> <code>${user.telegram_id}</code>\n💰 <b>Balance:</b> $${Number(user.balance).toFixed(2)} USDT`,
+    Markup.inlineKeyboard([
       [Markup.button.callback('🛍️ Shop Catalog', 'menu_shop'), Markup.button.callback('💰 Deposit', 'menu_wallet')],
       [Markup.button.callback('⬅️ Main Menu', 'main_menu')]
-    ])
-  });
+    ]),
+    null,
+    true
+  );
 });
 
 bot.action('menu_support', async (ctx) => {
   ctx.answerCbQuery();
   const cfg = await getSupplierConfig();
-  ctx.editMessageText(`🛟 Support: ${cfg.support_username}`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  return renderScreen(ctx, `🛟 Support: ${cfg.support_username}`, Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
 });
 
 bot.action('menu_recover', (ctx) => {
   ctx.answerCbQuery();
-  ctx.editMessageText('🔄 Order recover korte din: <code>/recover ORD-XXXX</code>', { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]) });
+  return renderScreen(ctx, '🔄 Order recover korte din: <code>/recover ORD-XXXX</code>', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'main_menu')]]), null, true);
 });
 
 bot.command('recover', async (ctx) => {
@@ -771,11 +902,12 @@ bot.command('supplier', async (ctx) => {
   ctx.reply(
     `⚙️ <b>CURRENT SUPPLIER & STORE SETTINGS</b>\n━━━━━━━━━━━━━━━━━━━━\n` +
     `🏪 <b>Store Name:</b> ${sup.store_name}\n` +
+    `🎨 <b>Theme Color:</b> ${sup.theme_color}\n` +
     `🌐 <b>Base URL:</b> <code>${sup.supplier_base_url}</code>\n` +
     `📈 <b>Profit Margin:</b> <code>${sup.profit_margin}%</code>\n` +
     `💱 <b>USD Rate:</b> <code>${sup.usd_to_bdt_rate} BDT</code>\n` +
     `💰 <b>Supplier Balance:</b> <b>${balText}</b>\n\n` +
-    `🖥️ <b>Web Admin Dashboard:</b>\n${appUrl ? `${appUrl}/admin` : ' `/admin` route on your server'}`,
+    `🖥️ <b>Web Admin Dashboard:</b>\n${appUrl ? `${appUrl}/admin` : '`/admin` route'}`,
     { parse_mode: 'HTML' }
   );
 });
@@ -793,24 +925,6 @@ bot.command('lastorders', async (ctx) => {
   } catch (err) {
     ctx.reply('Error: ' + (err.response?.data?.error || err.message));
   }
-});
-
-bot.command('setsupplier', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const args = ctx.message.text.replace('/setsupplier ', '').split('|').map(s => s.trim());
-  if (args.length < 2) {
-    return ctx.reply('Format:\n<code>/setsupplier https://prodseller.com | psk_your_key | 20</code>', { parse_mode: 'HTML' });
-  }
-
-  const [url, key, margin = '20'] = args;
-  await supabase.from('settings').upsert([{
-    id: 1,
-    supplier_base_url: url.replace(/\/$/, ''),
-    supplier_api_key: key,
-    profit_margin: parseFloat(margin)
-  }]);
-
-  ctx.reply(`✅ <b>Supplier Updated!</b> Ekhon <code>/sync</code> command din!`, { parse_mode: 'HTML' });
 });
 
 bot.command('sync', async (ctx) => {
@@ -835,49 +949,6 @@ bot.command('clearapi', async (ctx) => {
   if (!isAdmin(ctx)) return;
   await supabase.from('products').delete().eq('type', 'api');
   ctx.reply('🗑️ Sob API products delete kora hoyeche! Notun kore sync korte `/sync` din.');
-});
-
-bot.command('addprod', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const args = ctx.message.text.replace('/addprod ', '').split('|').map(s => s.trim());
-  if (args.length < 4) return ctx.reply('Format:\n/addprod Category | Plan Name | Price | Details | [local/api]');
-  const [category, name, price, description, type = 'local', url = null, key = null, prodId = null] = args;
-  
-  const { data, error } = await supabase.from('products').insert([{
-    category, name, price: parseFloat(price), description, type, supplier_api_url: url, supplier_api_key: key, supplier_product_id: prodId
-  }]).select();
-  if (error) return ctx.reply('Error: ' + error.message);
-  ctx.reply(`✅ Added! [${category} -> ${name}] | Product ID: ${data[0].id}`);
-});
-
-bot.command('addstock', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const args = ctx.message.text.replace('/addstock ', '').split('|').map(s => s.trim());
-  if (args.length < 2) return ctx.reply('Format: /addstock ProductID | Link');
-  await supabase.from('stock').insert([{ product_id: parseInt(args[0]), data: args[1] }]);
-  ctx.reply(`✅ Stock added to Product ID ${args[0]}!`);
-});
-
-bot.command('bulkstock', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const lines = ctx.message.text.split('\n').map(l => l.trim()).filter(Boolean);
-  const prodId = parseInt(lines[0].replace('/bulkstock', '').trim());
-  if (!prodId || lines.length < 2) return ctx.reply('Format:\n/bulkstock ProductID\nlink1\nlink2');
-
-  const items = lines.slice(1).map(data => ({ product_id: prodId, data }));
-  await supabase.from('stock').insert(items);
-  ctx.reply(`✅ ${items.length}ti stock Product ID ${prodId}-e add hoyeche!`);
-});
-
-bot.command('addbal', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const args = ctx.message.text.replace('/addbal ', '').split('|').map(s => s.trim());
-  if (args.length < 2) return ctx.reply('Format: /addbal TelegramID | Amount');
-  const { data: user } = await supabase.from('users').select('balance').eq('telegram_id', args[0]).single();
-  if (!user) return ctx.reply('User not found.');
-  const newBal = Number(user.balance) + parseFloat(args[1]);
-  await supabase.from('users').update({ balance: newBal }).eq('telegram_id', args[0]);
-  ctx.reply(`✅ Added $${args[1]} to ${args[0]}`);
 });
 
 // ==========================================
@@ -1016,7 +1087,7 @@ bot.on('text', async (ctx) => {
 });
 
 // ==========================================
-// 11. BUILT-IN WEB ADMIN DASHBOARD (/admin)
+// 11. UPGRADED WEB ADMIN DASHBOARD (/admin)
 // ==========================================
 function verifyAdminReq(req, res, next) {
   const pass = req.headers['x-admin-password'] || req.query.pass || req.body?.password;
@@ -1033,17 +1104,24 @@ app.get('/api/admin/data', verifyAdminReq, async (req, res) => {
 });
 
 app.post('/api/admin/settings', verifyAdminReq, async (req, res) => {
-  const { store_name, supplier_base_url, supplier_api_key, profit_margin, usd_to_bdt_rate, bkash_number, binance_pay_id, support_username } = req.body;
+  const {
+    store_name, supplier_base_url, supplier_api_key, profit_margin,
+    usd_to_bdt_rate, bkash_number, binance_pay_id, support_username,
+    theme_color, default_banner
+  } = req.body;
+
   const { error } = await supabase.from('settings').upsert([{
     id: 1,
     store_name,
-    supplier_base_url: supplier_base_url.replace(/\/$/, ''),
+    supplier_base_url: (supplier_base_url || '').replace(/\/$/, ''),
     supplier_api_key,
-    profit_margin: parseFloat(profit_margin),
-    usd_to_bdt_rate: parseFloat(usd_to_bdt_rate),
+    profit_margin: parseFloat(profit_margin || 20),
+    usd_to_bdt_rate: parseFloat(usd_to_bdt_rate || 130),
     bkash_number,
     binance_pay_id,
-    support_username
+    support_username,
+    theme_color: theme_color || 'emerald',
+    default_banner: default_banner || ''
   }]);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ success: true });
@@ -1059,18 +1137,33 @@ app.post('/api/admin/sync', verifyAdminReq, async (req, res) => {
 });
 
 app.post('/api/admin/product/update', verifyAdminReq, async (req, res) => {
-  const { id, category, name, price, api_stock, description } = req.body;
+  const { id, emoji, category, name, price, api_stock, sold_count, image_url, description } = req.body;
   const { error } = await supabase.from('products').update({
-    category, name, price: parseFloat(price), api_stock: parseInt(api_stock), description
+    emoji: emoji || '',
+    category,
+    name,
+    price: parseFloat(price || 0),
+    api_stock: parseInt(api_stock || 0),
+    sold_count: parseInt(sold_count || 0),
+    image_url: image_url || '',
+    description: description || ''
   }).eq('id', id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ success: true });
 });
 
 app.post('/api/admin/product/add', verifyAdminReq, async (req, res) => {
-  const { category, name, price, description, type, api_stock } = req.body;
+  const { emoji, category, name, price, description, type, api_stock, image_url } = req.body;
   const { error } = await supabase.from('products').insert([{
-    category, name, price: parseFloat(price), description, type: type || 'local', api_stock: parseInt(api_stock || 0)
+    emoji: emoji || '💥',
+    category,
+    name,
+    price: parseFloat(price || 1),
+    description: description || 'Automatically fulfilled through Nexas Cloud Store.',
+    type: type || 'local',
+    api_stock: parseInt(api_stock || 10),
+    image_url: image_url || '',
+    sold_count: 0
   }]);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ success: true });
@@ -1109,17 +1202,98 @@ app.get('/admin', (req, res) => {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Nexas Store — Admin Dashboard</title>
+  <title>Nexas Store — Visual Customizer Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
   <!-- Login Modal -->
   <div id="loginScreen" class="fixed inset-0 bg-slate-950 flex items-center justify-center p-4 z-50">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-sm shadow-2xl">
-      <h1 class="text-xl font-bold text-center mb-2">🛡️ Nexas Admin Panel</h1>
+      <h1 class="text-xl font-bold text-center mb-2">🎨 Nexas Visual Admin</h1>
       <p class="text-xs text-slate-400 text-center mb-5">Enter your ADMIN_PASSWORD or WEBHOOK_SECRET</p>
-      <input id="passInput" type="password" placeholder="Admin Password" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 mb-4 text-sm focus:outline-none focus:border-indigo-500" />
-      <button onclick="login()" class="w-full bg-indigo-600 hover:bg-indigo-500 font-semibold py-2.5 rounded-xl text-sm transition">Login to Dashboard</button>
+      <input id="passInput" type="password" placeholder="Admin Password" class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 mb-4 text-sm focus:outline-none focus:border-emerald-500" />
+      <button onclick="login()" class="w-full bg-emerald-600 hover:bg-emerald-500 font-semibold py-2.5 rounded-xl text-sm transition">Unlock Dashboard</button>
+    </div>
+  </div>
+
+  <!-- Product Visual Editor Modal -->
+  <div id="prodModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+      <div class="flex justify-between items-center mb-4 border-b border-slate-800 pb-3">
+        <h3 class="font-bold text-lg">🎨 Customize Product Card & Preview</h3>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="grid md:grid-cols-2 gap-6">
+        <div class="space-y-3 text-xs">
+          <input type="hidden" id="m_id" />
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="text-slate-400 block mb-1">Emoji Icon</label>
+              <input id="m_emoji" oninput="updatePreview()" placeholder="💥 or ✨" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-center text-base" />
+            </div>
+            <div class="col-span-2">
+              <label class="text-slate-400 block mb-1">Category</label>
+              <input id="m_cat" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Product / Plan Name</label>
+            <input id="m_name" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="text-slate-400 block mb-1">Price ($)</label>
+              <input id="m_price" type="number" step="0.01" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+            <div>
+              <label class="text-slate-400 block mb-1">Stock</label>
+              <input id="m_stock" type="number" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+            <div>
+              <label class="text-slate-400 block mb-1">Sold Count</label>
+              <input id="m_sold" type="number" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Banner Image URL (Direct Link .jpg / .png)</label>
+            <input id="m_img" oninput="updatePreview()" placeholder="https://i.imgur.com/example.png" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1">Product Description (Quote Box)</label>
+            <textarea id="m_desc" rows="4" oninput="updatePreview()" class="w-full bg-slate-800 border border-slate-700 rounded-lg p-3"></textarea>
+          </div>
+          <button onclick="saveModalProduct()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2.5 rounded-xl font-bold text-sm">💾 Save Product Changes</button>
+        </div>
+
+        <!-- Live Telegram Bot Preview -->
+        <div>
+          <p class="text-xs text-slate-400 mb-2">📱 Live Telegram Card Preview:</p>
+          <div class="bg-[#182533] border border-slate-700 rounded-2xl overflow-hidden shadow-xl text-xs">
+            <img id="prev_img" src="" class="w-full h-36 object-cover hidden" />
+            <div class="p-4 space-y-2 text-slate-200 font-sans">
+              <div class="text-slate-500">━━━━━━━━━━━━━━━━━━━━</div>
+              <div class="font-bold text-white text-sm"><span id="prev_emoji">💥</span> <span id="prev_name">Product Name</span> ✅</div>
+              <div class="text-slate-500">━━━━━━━━━━━━━━━━━━━━</div>
+              <div>💵 Price: $<span id="prev_price">0.90</span>  🛒 Qty: 1  💳 Total: $<span id="prev_total">0.90</span></div>
+              <div>📦 Stock: <span id="prev_stock">10</span>  📊 Sold: <span id="prev_sold">0</span> accounts</div>
+              <div class="pt-1">✅ Instant delivery</div>
+              <div class="text-slate-500">━━━━━━━━━━━━━━━━━━━━</div>
+              <div class="font-bold">🏷️ Product Description</div>
+              <div id="prev_desc" class="border-l-4 border-sky-500 bg-sky-950/40 pl-3 py-1.5 rounded text-slate-300 whitespace-pre-line"></div>
+            </div>
+            <div class="p-3 pt-0 space-y-1.5">
+              <div class="grid grid-cols-3 gap-1.5">
+                <div class="bg-[#2b5278] text-center py-1.5 rounded font-bold">-</div>
+                <div class="bg-[#8c4b43] text-center py-1.5 rounded font-bold">✏️ Qty: 1</div>
+                <div class="bg-[#2b5278] text-center py-1.5 rounded font-bold">+</div>
+              </div>
+              <div class="bg-[#3b7a3e] text-center py-2 rounded font-bold text-white">✅ Buy (Total: $<span id="prev_btn_total">0.90</span>)</div>
+              <div class="bg-[#243447] text-center py-2 rounded font-bold">📤 Share Product</div>
+              <div class="bg-[#8c4b43] text-center py-2 rounded font-bold">Back</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1127,48 +1301,38 @@ app.get('/admin', (req, res) => {
   <div id="appScreen" class="hidden max-w-7xl mx-auto p-4 md:p-6">
     <div class="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4 mb-6">
       <div>
-        <h1 class="text-2xl font-bold text-white">⚡ Nexas Bot Control Panel</h1>
-        <p class="text-xs text-slate-400">Customize your Telegram Bot in real-time</p>
+        <h1 class="text-2xl font-bold text-white">⚡ Nexas Store Visual Customizer</h1>
+        <p class="text-xs text-slate-400">Customize Store Theme, Product Images, Emojis, Categories & Descriptions</p>
       </div>
       <div class="flex gap-2">
-        <button onclick="syncNow()" id="syncBtn" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
+        <button onclick="syncNow()" id="syncBtn" class="theme-btn bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-xl text-xs font-semibold transition">🔄 1-Click Supplier Sync</button>
         <button onclick="loadData()" class="bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-xl text-xs font-semibold transition">↻ Refresh</button>
         <button onclick="logout()" class="bg-rose-600/20 text-rose-400 hover:bg-rose-600/30 px-3 py-2 rounded-xl text-xs font-semibold">Logout</button>
       </div>
     </div>
 
-    <!-- Stats Row -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
-        <p class="text-xs text-slate-400">Total Products</p>
-        <h2 id="statProducts" class="text-2xl font-bold mt-1">0</h2>
-      </div>
-      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
-        <p class="text-xs text-slate-400">Total Users</p>
-        <h2 id="statUsers" class="text-2xl font-bold mt-1">0</h2>
-      </div>
-      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
-        <p class="text-xs text-slate-400">Recent Orders</p>
-        <h2 id="statOrders" class="text-2xl font-bold mt-1">0</h2>
-      </div>
-      <div class="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
-        <p class="text-xs text-slate-400">Profit Margin</p>
-        <h2 id="statMargin" class="text-2xl font-bold mt-1 text-emerald-400">0%</h2>
-      </div>
-    </div>
-
-    <!-- Settings & Broadcast Grid -->
+    <!-- Settings & Theme Customizer -->
     <div class="grid md:grid-cols-3 gap-6 mb-8">
       <div class="md:col-span-2 bg-slate-900 border border-slate-800 rounded-2xl p-5">
-        <h3 class="font-bold text-base mb-4">⚙️ Store, Payment & Supplier Settings</h3>
+        <h3 class="font-bold text-base mb-4">🎨 Store Branding, Theme Color, Payment & Supplier</h3>
         <div class="grid sm:grid-cols-2 gap-3 text-xs">
           <div>
             <label class="text-slate-400 block mb-1">Store Name</label>
             <input id="s_store_name" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
           <div>
-            <label class="text-slate-400 block mb-1">Support Username</label>
-            <input id="s_support" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            <label class="text-slate-400 block mb-1">Store Theme Color & Badge</label>
+            <select id="s_theme" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2">
+              <option value="emerald">🟢 Emerald Green (Excalibur Style)</option>
+              <option value="blue">🔵 Ocean Blue</option>
+              <option value="purple">🟣 Royal Purple</option>
+              <option value="amber">🟡 Cyber Gold</option>
+              <option value="rose">🔴 Crimson Red</option>
+            </select>
+          </div>
+          <div class="sm:col-span-2">
+            <label class="text-slate-400 block mb-1">Default Store Banner Image URL (Optional)</label>
+            <input id="s_banner" placeholder="https://i.imgur.com/your-store-banner.png" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
           <div>
             <label class="text-slate-400 block mb-1">bKash Personal Number</label>
@@ -1194,45 +1358,59 @@ app.get('/admin', (req, res) => {
             <label class="text-slate-400 block mb-1">Supplier API Key</label>
             <input id="s_key" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
           </div>
+          <div class="sm:col-span-2">
+            <label class="text-slate-400 block mb-1">Support Username</label>
+            <input id="s_support" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+          </div>
         </div>
-        <button onclick="saveSettings()" class="mt-4 bg-indigo-600 hover:bg-indigo-500 px-5 py-2.5 rounded-xl text-xs font-semibold">💾 Save All Settings</button>
+        <button onclick="saveSettings()" class="theme-btn mt-4 bg-emerald-600 hover:bg-emerald-500 px-5 py-2.5 rounded-xl text-xs font-semibold">💾 Save All Store Settings</button>
       </div>
 
-      <!-- Broadcast & Add Product -->
+      <!-- Add Product with Emoji, Image & Description -->
       <div class="space-y-6">
         <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-          <h3 class="font-bold text-base mb-2">📢 Broadcast to All Users</h3>
-          <textarea id="bcText" rows="3" placeholder="Write announcement or offer (HTML supported)..." class="w-full bg-slate-800 border border-slate-700 rounded-xl p-3 text-xs mb-3"></textarea>
-          <button onclick="sendBroadcast()" class="w-full bg-amber-600 hover:bg-amber-500 py-2 rounded-xl text-xs font-semibold">🚀 Send Broadcast</button>
+          <h3 class="font-bold text-base mb-3">➕ Add New Custom Product</h3>
+          <div class="space-y-2 text-xs">
+            <div class="grid grid-cols-3 gap-2">
+              <input id="n_emoji" placeholder="Emoji (💥)" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-center" />
+              <input id="n_cat" placeholder="Category (Gemini)" class="col-span-2 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+            <input id="n_name" placeholder="Product Name (e.g. Gemini 18M premium)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            <div class="grid grid-cols-2 gap-2">
+              <input id="n_price" type="number" step="0.01" placeholder="Price ($0.90)" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+              <input id="n_stock" type="number" placeholder="Stock (11)" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            </div>
+            <input id="n_img" placeholder="Banner Image URL (.jpg/.png)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
+            <textarea id="n_desc" rows="2" placeholder="Product Description..." class="w-full bg-slate-800 border border-slate-700 rounded-lg p-2"></textarea>
+            <button onclick="addProduct()" class="theme-btn w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-xl font-semibold">➕ Create Product</button>
+          </div>
         </div>
 
         <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-          <h3 class="font-bold text-base mb-3">➕ Add Custom Product</h3>
-          <div class="space-y-2 text-xs">
-            <input id="n_cat" placeholder="Category (e.g. Gemini Pro)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
-            <input id="n_name" placeholder="Plan Name (e.g. 1 Year Link)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
-            <div class="grid grid-cols-2 gap-2">
-              <input id="n_price" type="number" step="0.01" placeholder="Price ($)" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
-              <input id="n_stock" type="number" placeholder="Stock" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2" />
-            </div>
-            <button onclick="addProduct()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded-xl font-semibold">Add Product</button>
-          </div>
+          <h3 class="font-bold text-base mb-2">📢 Broadcast to Users</h3>
+          <textarea id="bcText" rows="2" placeholder="Write announcement..." class="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-xs mb-2"></textarea>
+          <button onclick="sendBroadcast()" class="w-full bg-amber-600 hover:bg-amber-500 py-2 rounded-xl text-xs font-semibold">🚀 Send Broadcast</button>
         </div>
       </div>
     </div>
 
-    <!-- Products Manager Table -->
+    <!-- Products Visual Manager Table -->
     <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 mb-8">
-      <h3 class="font-bold text-base mb-4">🛍️ Products Manager (Edit Price, Name or Stock directly)</h3>
+      <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+        <h3 class="font-bold text-base">🛍️ Products Visual Customizer (Click "🎨 Customize" to edit Image, Description & Preview)</h3>
+        <input id="searchProd" oninput="renderProducts()" placeholder="🔍 Search product or category..." class="bg-slate-800 border border-slate-700 rounded-xl px-3 py-1.5 text-xs w-64" />
+      </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left text-xs">
           <thead class="text-slate-400 border-b border-slate-800">
             <tr>
-              <th class="pb-2">ID</th>
+              <th class="pb-2">Banner</th>
+              <th class="pb-2">Emoji</th>
               <th class="pb-2">Category</th>
-              <th class="pb-2">Plan Name</th>
-              <th class="pb-2">Price ($ USDT)</th>
+              <th class="pb-2">Product Name</th>
+              <th class="pb-2">Price ($)</th>
               <th class="pb-2">Stock</th>
+              <th class="pb-2">Sold</th>
               <th class="pb-2">Actions</th>
             </tr>
           </thead>
@@ -1241,7 +1419,7 @@ app.get('/admin', (req, res) => {
       </div>
     </div>
 
-    <!-- Users & Recent Orders -->
+    <!-- Users & Orders -->
     <div class="grid md:grid-cols-2 gap-6">
       <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
         <h3 class="font-bold text-base mb-4">👥 Users & Wallet Balance</h3>
@@ -1280,6 +1458,8 @@ app.get('/admin', (req, res) => {
 
   <script>
     let ADMIN_KEY = localStorage.getItem('nexas_admin_key') || '';
+    let ALL_PRODUCTS = [];
+
     if (ADMIN_KEY) loadData();
 
     async function api(path, method = 'GET', body = null) {
@@ -1313,6 +1493,8 @@ app.get('/admin', (req, res) => {
 
       const s = data.settings;
       document.getElementById('s_store_name').value = s.store_name || '';
+      document.getElementById('s_theme').value = s.theme_color || 'emerald';
+      document.getElementById('s_banner').value = s.default_banner || '';
       document.getElementById('s_support').value = s.support_username || '';
       document.getElementById('s_bkash').value = s.bkash_number || '';
       document.getElementById('s_binance').value = s.binance_pay_id || '';
@@ -1321,25 +1503,8 @@ app.get('/admin', (req, res) => {
       document.getElementById('s_url').value = s.supplier_base_url || '';
       document.getElementById('s_key').value = s.supplier_api_key || '';
 
-      document.getElementById('statProducts').innerText = data.products.length;
-      document.getElementById('statUsers').innerText = data.users.length;
-      document.getElementById('statOrders').innerText = data.orders.length;
-      document.getElementById('statMargin').innerText = (s.profit_margin ?? 20) + '%';
-
-      const pBody = document.getElementById('productsTable');
-      pBody.innerHTML = data.products.map(p => \`
-        <tr class="hover:bg-slate-800/40">
-          <td class="py-2 pr-2 font-mono">\${p.id}</td>
-          <td class="py-2 pr-2"><input id="p_cat_\${p.id}" value="\${(p.category||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-40" /></td>
-          <td class="py-2 pr-2"><input id="p_name_\${p.id}" value="\${(p.name||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-44" /></td>
-          <td class="py-2 pr-2"><input id="p_price_\${p.id}" type="number" step="0.01" value="\${p.price}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
-          <td class="py-2 pr-2"><input id="p_stock_\${p.id}" type="number" value="\${p.api_stock ?? 0}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
-          <td class="py-2 space-x-1">
-            <button onclick="saveProd(\${p.id})" class="bg-indigo-600 hover:bg-indigo-500 px-2.5 py-1 rounded font-semibold">Save</button>
-            <button onclick="delProd(\${p.id})" class="bg-rose-600/30 text-rose-300 hover:bg-rose-600 px-2 py-1 rounded">Del</button>
-          </td>
-        </tr>
-      \`).join('');
+      ALL_PRODUCTS = data.products || [];
+      renderProducts();
 
       const uBody = document.getElementById('usersTable');
       uBody.innerHTML = data.users.map(u => \`
@@ -1361,9 +1526,119 @@ app.get('/admin', (req, res) => {
       \`).join('');
     }
 
+    function renderProducts() {
+      const q = (document.getElementById('searchProd')?.value || '').toLowerCase();
+      const filtered = ALL_PRODUCTS.filter(p =>
+        (p.name || '').toLowerCase().includes(q) || (p.category || '').toLowerCase().includes(q)
+      );
+
+      const pBody = document.getElementById('productsTable');
+      pBody.innerHTML = filtered.map(p => \`
+        <tr class="hover:bg-slate-800/40">
+          <td class="py-2 pr-2">
+            \${p.image_url ? \`<img src="\${p.image_url}" class="w-10 h-7 object-cover rounded border border-slate-700" />\` : '<span class="text-slate-600">No Img</span>'}
+          </td>
+          <td class="py-2 pr-2"><input id="p_emoji_\${p.id}" value="\${(p.emoji||'💥').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-12 text-center" /></td>
+          <td class="py-2 pr-2"><input id="p_cat_\${p.id}" value="\${(p.category||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-36" /></td>
+          <td class="py-2 pr-2"><input id="p_name_\${p.id}" value="\${(p.name||'').replace(/"/g, '&quot;')}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-44" /></td>
+          <td class="py-2 pr-2"><input id="p_price_\${p.id}" type="number" step="0.01" value="\${p.price}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-20" /></td>
+          <td class="py-2 pr-2"><input id="p_stock_\${p.id}" type="number" value="\${p.api_stock ?? 0}" class="bg-slate-800 border border-slate-700 rounded px-2 py-1 w-16" /></td>
+          <td class="py-2 pr-2 font-mono text-slate-400">\${p.sold_count ?? 0}</td>
+          <td class="py-2 space-x-1 whitespace-nowrap">
+            <button onclick="openModal(\${p.id})" class="bg-indigo-600 hover:bg-indigo-500 px-2.5 py-1 rounded font-semibold">🎨 Customize</button>
+            <button onclick="quickSaveProd(\${p.id})" class="bg-emerald-600 hover:bg-emerald-500 px-2.5 py-1 rounded font-semibold">💾</button>
+            <button onclick="delProd(\${p.id})" class="bg-rose-600/30 text-rose-300 hover:bg-rose-600 px-2 py-1 rounded">🗑️</button>
+          </td>
+        </tr>
+      \`).join('');
+    }
+
+    function openModal(id) {
+      const p = ALL_PRODUCTS.find(x => x.id === id);
+      if (!p) return;
+      document.getElementById('m_id').value = p.id;
+      document.getElementById('m_emoji').value = p.emoji || '💥';
+      document.getElementById('m_cat').value = p.category || '';
+      document.getElementById('m_name').value = p.name || '';
+      document.getElementById('m_price').value = p.price || 0;
+      document.getElementById('m_stock').value = p.api_stock ?? 0;
+      document.getElementById('m_sold').value = p.sold_count ?? 0;
+      document.getElementById('m_img').value = p.image_url || '';
+      document.getElementById('m_desc').value = p.description || '';
+      updatePreview();
+      document.getElementById('prodModal').classList.remove('hidden');
+    }
+
+    function closeModal() {
+      document.getElementById('prodModal').classList.add('hidden');
+    }
+
+    function updatePreview() {
+      const emoji = document.getElementById('m_emoji').value || '💥';
+      const name = document.getElementById('m_name').value || 'Product Name';
+      const price = Number(document.getElementById('m_price').value || 0).toFixed(2);
+      const stock = document.getElementById('m_stock').value || 0;
+      const sold = document.getElementById('m_sold').value || 0;
+      const img = document.getElementById('m_img').value.trim();
+      const desc = document.getElementById('m_desc').value || 'Automatically fulfilled through Nexas Cloud Store.';
+
+      document.getElementById('prev_emoji').innerText = emoji;
+      document.getElementById('prev_name').innerText = name;
+      document.getElementById('prev_price').innerText = price;
+      document.getElementById('prev_total').innerText = price;
+      document.getElementById('prev_btn_total').innerText = price;
+      document.getElementById('prev_stock').innerText = stock;
+      document.getElementById('prev_sold').innerText = sold;
+      document.getElementById('prev_desc').innerText = desc;
+
+      const imgEl = document.getElementById('prev_img');
+      if (img && img.startsWith('http')) {
+        imgEl.src = img;
+        imgEl.classList.remove('hidden');
+      } else {
+        imgEl.classList.add('hidden');
+      }
+    }
+
+    async function saveModalProduct() {
+      const id = Number(document.getElementById('m_id').value);
+      await api('/api/admin/product/update', 'POST', {
+        id,
+        emoji: document.getElementById('m_emoji').value,
+        category: document.getElementById('m_cat').value,
+        name: document.getElementById('m_name').value,
+        price: document.getElementById('m_price').value,
+        api_stock: document.getElementById('m_stock').value,
+        sold_count: document.getElementById('m_sold').value,
+        image_url: document.getElementById('m_img').value,
+        description: document.getElementById('m_desc').value
+      });
+      closeModal();
+      loadData();
+    }
+
+    async function quickSaveProd(id) {
+      const p = ALL_PRODUCTS.find(x => x.id === id);
+      await api('/api/admin/product/update', 'POST', {
+        id,
+        emoji: document.getElementById('p_emoji_' + id).value,
+        category: document.getElementById('p_cat_' + id).value,
+        name: document.getElementById('p_name_' + id).value,
+        price: document.getElementById('p_price_' + id).value,
+        api_stock: document.getElementById('p_stock_' + id).value,
+        sold_count: p?.sold_count ?? 0,
+        image_url: p?.image_url || '',
+        description: p?.description || ''
+      });
+      alert('✅ Saved!');
+      loadData();
+    }
+
     async function saveSettings() {
       await api('/api/admin/settings', 'POST', {
         store_name: document.getElementById('s_store_name').value,
+        theme_color: document.getElementById('s_theme').value,
+        default_banner: document.getElementById('s_banner').value,
         support_username: document.getElementById('s_support').value,
         bkash_number: document.getElementById('s_bkash').value,
         binance_pay_id: document.getElementById('s_binance').value,
@@ -1372,7 +1647,7 @@ app.get('/admin', (req, res) => {
         supplier_base_url: document.getElementById('s_url').value,
         supplier_api_key: document.getElementById('s_key').value
       });
-      alert('✅ Settings Saved Successfully!');
+      alert('✅ Store Settings & Theme Saved!');
       loadData();
     }
 
@@ -1389,17 +1664,6 @@ app.get('/admin', (req, res) => {
       btn.innerText = '🔄 1-Click Supplier Sync';
     }
 
-    async function saveProd(id) {
-      await api('/api/admin/product/update', 'POST', {
-        id,
-        category: document.getElementById('p_cat_' + id).value,
-        name: document.getElementById('p_name_' + id).value,
-        price: document.getElementById('p_price_' + id).value,
-        api_stock: document.getElementById('p_stock_' + id).value
-      });
-      alert('✅ Product Updated!');
-    }
-
     async function delProd(id) {
       if (!confirm('Delete this product?')) return;
       await api('/api/admin/product/delete', 'POST', { id });
@@ -1408,21 +1672,23 @@ app.get('/admin', (req, res) => {
 
     async function addProduct() {
       await api('/api/admin/product/add', 'POST', {
+        emoji: document.getElementById('n_emoji').value,
         category: document.getElementById('n_cat').value,
         name: document.getElementById('n_name').value,
         price: document.getElementById('n_price').value,
         api_stock: document.getElementById('n_stock').value,
-        type: 'api',
-        description: '• Instant Automated Delivery'
+        image_url: document.getElementById('n_img').value,
+        description: document.getElementById('n_desc').value,
+        type: 'api'
       });
-      alert('✅ Product Added!');
+      alert('✅ Product Created!');
       loadData();
     }
 
     async function saveBal(tgId) {
       const bal = document.getElementById('u_bal_' + tgId).value;
       await api('/api/admin/user/balance', 'POST', { telegram_id: tgId, balance: bal });
-      alert('✅ User Balance Updated!');
+      alert('✅ Balance Updated!');
     }
 
     async function sendBroadcast() {
@@ -1440,7 +1706,7 @@ app.get('/admin', (req, res) => {
 // ==========================================
 // 12. Safe Server & Webhook Setup
 // ==========================================
-app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7! Visit /admin for Control Panel.'));
+app.get('/', (req, res) => res.send('Nexas Cloud Store Bot is running 24/7! Visit /admin for Visual Customizer.'));
 app.use(bot.webhookCallback('/telegram-webhook'));
 bot.catch((err) => console.error('Bot Error:', err));
 
